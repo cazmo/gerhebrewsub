@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1778807457069,
+      "tag": "0000_great_sentry",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1778807542024,
+      "tag": "0001_strong_bedlam",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1778811973433,
+      "tag": "0002_fixed_harry_osborn",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,0 +1,186 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(0.12 0.015 270);
+  --foreground: oklch(0.95 0.01 270);
+  --card: oklch(0.16 0.02 270);
+  --card-foreground: oklch(0.95 0.01 270);
+  --popover: oklch(0.14 0.02 270);
+  --popover-foreground: oklch(0.95 0.01 270);
+  --primary: oklch(0.62 0.22 280);
+  --primary-foreground: oklch(0.98 0.005 280);
+  --secondary: oklch(0.22 0.04 270);
+  --secondary-foreground: oklch(0.90 0.01 270);
+  --muted: oklch(0.20 0.03 270);
+  --muted-foreground: oklch(0.65 0.02 270);
+  --accent: oklch(0.55 0.18 290);
+  --accent-foreground: oklch(0.98 0.005 290);
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.98 0.005 25);
+  --border: oklch(0.28 0.04 270);
+  --input: oklch(0.20 0.03 270);
+  --ring: oklch(0.62 0.22 280);
+  --radius: 0.75rem;
+  --chart-1: oklch(0.62 0.22 280);
+  --chart-2: oklch(0.55 0.18 290);
+  --chart-3: oklch(0.50 0.15 260);
+  --chart-4: oklch(0.65 0.20 300);
+  --chart-5: oklch(0.58 0.25 270);
+  --sidebar: oklch(0.14 0.02 270);
+  --sidebar-foreground: oklch(0.90 0.01 270);
+  --sidebar-primary: oklch(0.62 0.22 280);
+  --sidebar-primary-foreground: oklch(0.98 0.005 280);
+  --sidebar-accent: oklch(0.20 0.03 270);
+  --sidebar-accent-foreground: oklch(0.90 0.01 270);
+  --sidebar-border: oklch(0.28 0.04 270);
+  --sidebar-ring: oklch(0.62 0.22 280);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: "Heebo", "Arial Hebrew", sans-serif;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    direction: rtl;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-family: "Heebo", "Arial Hebrew", sans-serif;
+    direction: rtl;
+  }
+  .flex {
+    min-width: 0;
+    min-height: 0;
+  }
+  .container {
+    @apply mx-auto px-4;
+    max-width: 1200px;
+  }
+}
+
+/* ── Glass card ─────────────────────────────────────────────────────────────── */
+.glass-card {
+  background: oklch(0.18 0.025 270 / 0.7);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  border: 1px solid oklch(0.35 0.05 270 / 0.4);
+  border-radius: var(--radius);
+  box-shadow:
+    0 4px 24px oklch(0.05 0.02 270 / 0.6),
+    inset 0 1px 0 oklch(0.5 0.1 270 / 0.15);
+}
+
+/* ── Status badge colours ───────────────────────────────────────────────────── */
+.status-pending    { @apply bg-muted text-muted-foreground; }
+.status-uploading  { @apply bg-blue-900/40 text-blue-300; }
+.status-transcribing { @apply bg-indigo-900/40 text-indigo-300; }
+.status-translating  { @apply bg-violet-900/40 text-violet-300; }
+.status-embedding    { @apply bg-purple-900/40 text-purple-300; }
+.status-completed    { @apply bg-emerald-900/40 text-emerald-300; }
+.status-failed       { @apply bg-red-900/40 text-red-300; }
+
+/* ── Gradient background ────────────────────────────────────────────────────── */
+.gradient-bg {
+  background:
+    radial-gradient(ellipse 80% 60% at 50% -10%, oklch(0.30 0.12 280 / 0.35) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 40% at 90% 80%, oklch(0.25 0.10 260 / 0.25) 0%, transparent 60%),
+    var(--background);
+}
+
+/* ── Upload drop zone ───────────────────────────────────────────────────────── */
+.drop-zone {
+  border: 2px dashed oklch(0.45 0.12 280 / 0.5);
+  transition: border-color 0.2s, background 0.2s;
+}
+.drop-zone:hover,
+.drop-zone.drag-over {
+  border-color: oklch(0.62 0.22 280);
+  background: oklch(0.62 0.22 280 / 0.06);
+}
+
+/* ── Progress bar animation ─────────────────────────────────────────────────── */
+@keyframes progress-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.progress-pulse {
+  animation: progress-pulse 1.5s ease-in-out infinite;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: oklch(0.35 0.05 270); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(0.45 0.08 270); }
+
+/* ── Shimmer animation (progress bar) ──────────────────────────────────────── */
+@keyframes shimmer {
+  0%   { transform: translateX(200%); }
+  100% { transform: translateX(-200%); }
+}
+.animate-shimmer {
+  animation: shimmer 1.8s linear infinite;
+}
+
+/* ── Per-step progress bar ──────────────────────────────────────────────────── */
+@keyframes step-progress {
+  0%   { width: 0%; }
+  60%  { width: 75%; }
+  80%  { width: 85%; }
+  100% { width: 92%; }
+}
+.animate-step-progress {
+  animation: step-progress 8s cubic-bezier(0.23, 1, 0.32, 1) forwards;
+}
+
+/* ── Fade in ────────────────────────────────────────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fade-in 0.4s cubic-bezier(0.23, 1, 0.32, 1) both;
+}
