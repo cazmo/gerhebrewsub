@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "מתרגם כתוביות גרמנית→עברית"
+version = "1.0.0"
+id = "artifacts/gerhebrewsub"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21837
+
+[services.development]
+run = "pnpm --filter @workspace/gerhebrewsub run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/gerhebrewsub", "run", "build" ]
+publicDir = "artifacts/gerhebrewsub/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21837"
+BASE_PATH = "/"
