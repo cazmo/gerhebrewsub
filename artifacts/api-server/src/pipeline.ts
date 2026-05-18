@@ -759,7 +759,7 @@ async function embedSubtitles(
   // BorderStyle=4 → opaque box background (BackColour) drawn behind text
   const style = [
     "FontName=DejaVu Sans",
-    "FontSize=24",
+    "FontSize=29",
     `Alignment=${alignment}`,
     "MarginV=40",
     "MarginL=40",
@@ -767,8 +767,8 @@ async function embedSubtitles(
     "PrimaryColour=&H00FFFFFF",
     "OutlineColour=&H00000000",
     "BackColour=&HCC000000",
-    "BorderStyle=4",
-    "Outline=8",
+    "BorderStyle=3",
+    "Outline=4",
     "Shadow=0",
     "Bold=0",
   ].join(",");
