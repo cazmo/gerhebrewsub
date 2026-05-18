@@ -283,9 +283,87 @@ interface OcrResult {
   hasBurnedInSubs: boolean;
 }
 
+/**
+ * Fast detection: sample only N evenly-spaced frames to decide if burned-in
+ * subtitles exist. Much cheaper than scanning the full video.
+ */
+async function detectBurnedInSubsFast(
+  videoPath: string,
+  tmpDir: string,
+  maxFrames = 6,
+): Promise<boolean> {
+  const duration = await getAudioDuration(videoPath);
+  if (duration <= 0) return false;
+
+  const framesDir = path.join(tmpDir, "detect_frames");
+  await fs.mkdir(framesDir, { recursive: true });
+
+  // Extract evenly-spaced frames (skip first and last 5%)
+  const step = duration / (maxFrames + 1);
+  const timestamps = Array.from({ length: maxFrames }, (_, i) => step * (i + 1));
+
+  await Promise.all(
+    timestamps.map((ts, i) =>
+      execFileAsync("ffmpeg", [
+        "-y", "-ss", String(ts.toFixed(2)),
+        "-i", videoPath,
+        "-frames:v", "1",
+        "-q:v", "5",
+        "-vf", "crop=iw:ih*0.25:0:ih*0.75", // bottom 25% only
+        path.join(framesDir, `detect_${String(i).padStart(2, "0")}.jpg`),
+      ]).catch(() => null)
+    )
+  );
+
+  const frameFiles = (await fs.readdir(framesDir)).sort();
+  if (frameFiles.length === 0) return false;
+
+  const openai = getOpenAI();
+
+  // Send all frames in one API call
+  const imageContents = await Promise.all(
+    frameFiles.map(async (f) => {
+      const buf = await fs.readFile(path.join(framesDir, f)).catch(() => null);
+      if (!buf) return null;
+      return {
+        type: "image_url" as const,
+        image_url: { url: `data:image/jpeg;base64,${buf.toString("base64")}`, detail: "low" as const },
+      };
+    })
+  );
+  const validImages = imageContents.filter(Boolean) as Array<{ type: "image_url"; image_url: { url: string; detail: "low" } }>;
+  if (validImages.length === 0) return false;
+
+  try {
+    const res = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...validImages,
+            {
+              type: "text",
+              text:
+                "These are cropped bottom-strip frames from a video. " +
+                "Do any of them contain burned-in subtitle text or on-screen captions? " +
+                "Reply with ONLY 'yes' or 'no'.",
+            },
+          ],
+        },
+      ],
+      max_tokens: 5,
+    });
+    const answer = (res.choices[0]?.message?.content ?? "").trim().toLowerCase();
+    return answer.startsWith("y");
+  } catch {
+    return false;
+  }
+}
+
 async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: string): Promise<OcrResult> {
   const framesDir = path.join(tmpDir, "frames");
-  await fs.mkdir(framesDir);
+  await fs.mkdir(framesDir, { recursive: true });
   await execFileAsync("ffmpeg", [
     "-i", videoPath,
     "-vf", "fps=1/5",
@@ -665,7 +743,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       const videoDuration = await getAudioDuration(videoPath);
       if (videoDuration > 0 && videoDuration > MAX_VIDEO_DURATION_SEC) {
         const mins = Math.round(videoDuration / 60);
-        throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 110 דקות.`);
+        throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 120 דקות.`);
       }
 
       // ── Transcribing ────────────────────────────────────────────────────────
@@ -689,11 +767,10 @@ export async function runPipeline(jobId: string): Promise<void> {
           await updateJob(jobId, { hasBurnedInSubs: true });
         }
       } else {
-        // Even if audio exists, check for burned-in subs in background to decide
-        // whether to cover them when embedding. We use a quick frame sample.
+        // Even if audio exists, quickly check for burned-in subs (6 frames, 1 API call)
+        // so we know whether to cover them when embedding.
         try {
-          const quickOcr = await extractTextViaOcr(videoPath, tmpDir, targetLang);
-          hasBurnedInSubs = quickOcr.hasBurnedInSubs;
+          hasBurnedInSubs = await detectBurnedInSubsFast(videoPath, tmpDir);
           if (hasBurnedInSubs) await updateJob(jobId, { hasBurnedInSubs: true });
         } catch {
           // non-critical — proceed without covering
