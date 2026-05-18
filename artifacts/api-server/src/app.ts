@@ -270,13 +270,74 @@ app.get("/api/download/:jobId", async (req, res) => {
       res.status(404).json({ error: "סרטון לא נמצא" });
       return;
     }
-    const filename = `video-hebrew-${req.params.jobId.slice(0, 8)}.mp4`;
+    const filename = `video-subtitled-${req.params.jobId.slice(0, 8)}.mp4`;
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     const file = gcsBucket().file(job.outputKey);
     file.createReadStream()
       .on("error", (streamErr) => {
         logger.error({ err: streamErr }, "GCS download error");
+        if (!res.headersSent) res.status(500).json({ error: "שגיאה בהורדה" });
+      })
+      .pipe(res);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "שגיאה";
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.get("/api/stream/:jobId", async (req, res) => {
+  try {
+    const job = await getJobById(req.params.jobId);
+    if (!job || job.status !== "completed" || !job.outputKey) {
+      res.status(404).json({ error: "סרטון לא נמצא" });
+      return;
+    }
+    const file = gcsBucket().file(job.outputKey);
+    const [metadata] = await file.getMetadata();
+    const fileSize = Number(metadata.size ?? 0);
+
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Accept-Ranges", "bytes");
+
+    const rangeHeader = req.headers.range;
+    if (rangeHeader && fileSize > 0) {
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader("Content-Length", chunkSize);
+      file.createReadStream({ start, end })
+        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
+        .pipe(res);
+    } else {
+      if (fileSize > 0) res.setHeader("Content-Length", fileSize);
+      file.createReadStream()
+        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
+        .pipe(res);
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "שגיאה";
+    if (!res.headersSent) res.status(500).json({ error: msg });
+  }
+});
+
+app.get("/api/download-srt/:jobId", async (req, res) => {
+  try {
+    const job = await getJobById(req.params.jobId);
+    if (!job || job.status !== "completed" || !job.srtKey) {
+      res.status(404).json({ error: "קובץ כתוביות לא נמצא" });
+      return;
+    }
+    const filename = `subtitles-${req.params.jobId.slice(0, 8)}.srt`;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    const file = gcsBucket().file(job.srtKey);
+    file.createReadStream()
+      .on("error", (streamErr) => {
+        logger.error({ err: streamErr }, "GCS SRT download error");
         if (!res.headersSent) res.status(500).json({ error: "שגיאה בהורדה" });
       })
       .pipe(res);

@@ -349,6 +349,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
 const TRANSLATE_BATCH = 15;
+const TRANSLATE_CONCURRENCY = 4;
 
 function parseTranslationLines(raw: string, expected: number): string[] | null {
   let lines = raw.split("\n").filter((l) => l.trim());
@@ -436,12 +437,26 @@ async function translateSegments(
   const results: string[] = new Array(segments.length).fill("");
   const openai = getOpenAI();
 
+  const batches: Array<{ batch: WhisperSegment[]; startIdx: number; label: string }> = [];
   for (let i = 0; i < segments.length; i += TRANSLATE_BATCH) {
-    const batch = segments.slice(i, i + TRANSLATE_BATCH);
-    const batchLabel = `batch ${Math.floor(i / TRANSLATE_BATCH) + 1}`;
-    const translations = await translateBatch(openai, batch, sourceLang, targetLang, batchLabel);
-    for (let j = 0; j < batch.length; j++) {
-      results[i + j] = translations[j] ?? batch[j].text;
+    batches.push({
+      batch: segments.slice(i, i + TRANSLATE_BATCH),
+      startIdx: i,
+      label: `batch ${Math.floor(i / TRANSLATE_BATCH) + 1}`,
+    });
+  }
+
+  for (let g = 0; g < batches.length; g += TRANSLATE_CONCURRENCY) {
+    const group = batches.slice(g, g + TRANSLATE_CONCURRENCY);
+    const groupResults = await Promise.all(
+      group.map(({ batch, label }) => translateBatch(openai, batch, sourceLang, targetLang, label))
+    );
+    for (let j = 0; j < group.length; j++) {
+      const { startIdx, batch } = group[j];
+      const translations = groupResults[j];
+      for (let k = 0; k < batch.length; k++) {
+        results[startIdx + k] = translations[k] ?? batch[k].text;
+      }
     }
   }
   return results;
@@ -531,6 +546,7 @@ async function downloadYouTube(url: string, outputPath: string, cookiesPath?: st
 
 /**
  * Embeds subtitles into the video.
+ * position: "bottom" (default) or "top"
  * When coverOriginalSubs=true, a black bar is drawn over the bottom 15% of the
  * frame to erase burned-in subtitles before the translated ones are applied.
  */
@@ -539,16 +555,18 @@ async function embedSubtitles(
   srtPath: string,
   outputPath: string,
   coverOriginalSubs: boolean,
+  position: "bottom" | "top" = "bottom",
 ): Promise<void> {
   const escapedSrt = srtPath
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
     .replace(/'/g, "\\'");
 
+  const alignment = position === "top" ? 8 : 2;
   const style = [
     "FontName=DejaVu Sans",
     "FontSize=26",
-    "Alignment=2",
+    `Alignment=${alignment}`,
     "MarginV=35",
     "PrimaryColour=&H00FFFFFF",
     "OutlineColour=&H00000000",
@@ -719,14 +737,20 @@ export async function runPipeline(jobId: string): Promise<void> {
       const srtPath = path.join(tmpDir, "subtitles.srt");
       await fs.writeFile(srtPath, srtContent, "utf8");
 
+      const subtitlePosition = (job.subtitlePosition === "top" ? "top" : "bottom") as "top" | "bottom";
       const outputVideoPath = path.join(tmpDir, "output.mp4");
-      await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs);
+      await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
 
       const outputKey = `outputs/${jobId}/${nanoid(8)}.mp4`;
-      const outputBuffer = await fs.readFile(outputVideoPath);
+      const srtKey = `outputs/${jobId}/subtitles.srt`;
+
+      const [outputBuffer] = await Promise.all([
+        fs.readFile(outputVideoPath),
+        gcsUpload(srtKey, Buffer.from(srtContent, "utf8"), "text/plain"),
+      ]);
       await gcsUpload(outputKey, outputBuffer, "video/mp4");
 
-      await updateJob(jobId, { status: "completed", outputKey });
+      await updateJob(jobId, { status: "completed", outputKey, srtKey });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       await updateJob(jobId, { status: "failed", errorMessage: message, failedAtStatus: currentStatus }).catch(() => {});
@@ -743,6 +767,7 @@ export async function createFileJob(
   localPath?: string,
   sourceLang = "auto",
   targetLang = "he",
+  subtitlePosition = "bottom",
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -755,6 +780,7 @@ export async function createFileJob(
     originalFilename,
     sourceLang,
     targetLang,
+    subtitlePosition,
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;
@@ -766,6 +792,7 @@ export async function createYouTubeJob(
   userId?: number,
   sourceLang = "auto",
   targetLang = "he",
+  subtitlePosition = "bottom",
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -777,6 +804,7 @@ export async function createYouTubeJob(
     inputKey: cookiesKey ?? null,
     sourceLang,
     targetLang,
+    subtitlePosition,
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;

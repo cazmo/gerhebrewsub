@@ -22,6 +22,8 @@ export const jobs = pgTable("jobs", {
   sourceLang: varchar("source_lang", { length: 10 }).default("auto").notNull(),
   targetLang: varchar("target_lang", { length: 10 }).default("he").notNull(),
   hasBurnedInSubs: boolean("has_burned_in_subs").default(false),
+  srtKey: text("srt_key"),
+  subtitlePosition: varchar("subtitle_position", { length: 10 }).default("bottom").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

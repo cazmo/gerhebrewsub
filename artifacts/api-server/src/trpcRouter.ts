@@ -50,6 +50,7 @@ export const appRouter = t.router({
           localPath: z.string().optional(),
           sourceLang: langCodeSchema,
           targetLang: langCodeSchema,
+          subtitlePosition: z.enum(["bottom", "top"]).optional(),
         })
       )
       .mutation(async ({ input }) => {
@@ -60,6 +61,7 @@ export const appRouter = t.router({
           input.localPath,
           input.sourceLang ?? "auto",
           input.targetLang ?? "he",
+          input.subtitlePosition ?? "bottom",
         );
         return { jobId };
       }),
@@ -71,6 +73,7 @@ export const appRouter = t.router({
           cookiesKey: z.string().optional(),
           sourceLang: langCodeSchema,
           targetLang: langCodeSchema,
+          subtitlePosition: z.enum(["bottom", "top"]).optional(),
         })
       )
       .mutation(async ({ input }) => {
@@ -89,6 +92,7 @@ export const appRouter = t.router({
           undefined,
           input.sourceLang ?? "auto",
           input.targetLang ?? "he",
+          input.subtitlePosition ?? "bottom",
         );
         return { jobId };
       }),
@@ -111,6 +115,17 @@ export const appRouter = t.router({
           throw new TRPCError({ code: "BAD_REQUEST", message: "הסרטון עדיין לא מוכן" });
         }
         return { url: `/api/download/${input.id}` };
+      }),
+
+    getSrtUrl: t.procedure
+      .input(z.object({ id: z.string() }))
+      .query(async ({ input }) => {
+        const job = await getJobById(input.id);
+        if (!job) throw new TRPCError({ code: "NOT_FOUND", message: "עבודה לא נמצאה" });
+        if (job.status !== "completed" || !job.srtKey) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "קובץ הכתוביות עדיין לא מוכן" });
+        }
+        return { url: `/api/download-srt/${input.id}` };
       }),
 
     prepareCookieCapture: t.procedure

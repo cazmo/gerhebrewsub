@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useLocation } from "wouter";
 import { toast } from "sonner";
 import { trpc } from "../lib/trpc";
-import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight, Clipboard } from "lucide-react";
+import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight, Clipboard, AlignVerticalJustifyStart, AlignVerticalJustifyEnd } from "lucide-react";
 
 type Tab = "file" | "youtube";
 
@@ -121,6 +121,7 @@ export default function Home() {
   const [uploadPct, setUploadPct] = useState(0);
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("he");
+  const [subtitlePosition, setSubtitlePosition] = useState<"bottom" | "top">("bottom");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const startFromFile = trpc.jobs.startFromFile.useMutation();
@@ -161,6 +162,7 @@ export default function Home() {
         localPath,
         sourceLang,
         targetLang,
+        subtitlePosition,
       });
       setLocation(`/job/${jobId}`);
     } catch (err) {
@@ -184,6 +186,7 @@ export default function Home() {
         cookiesKey,
         sourceLang,
         targetLang,
+        subtitlePosition,
       });
       setLocation(`/job/${jobId}`);
     } catch (err) {
@@ -234,6 +237,28 @@ export default function Home() {
             <span>{sourceLangLabel}</span>
             <span className="text-primary">→</span>
             <span className="font-medium text-foreground">{targetLangLabel}</span>
+          </div>
+
+          {/* Subtitle position */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs text-muted-foreground font-medium">מיקום כתוביות</label>
+            <div className="grid grid-cols-2 gap-2">
+              {(["bottom", "top"] as const).map((pos) => (
+                <button
+                  key={pos}
+                  type="button"
+                  onClick={() => setSubtitlePosition(pos)}
+                  className={`flex items-center justify-center gap-2 py-2 px-3 rounded-xl border text-sm font-medium transition-all ${
+                    subtitlePosition === pos
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border bg-transparent text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  {pos === "bottom" ? <AlignVerticalJustifyEnd size={14} /> : <AlignVerticalJustifyStart size={14} />}
+                  {pos === "bottom" ? "למטה" : "למעלה"}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
