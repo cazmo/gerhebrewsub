@@ -411,7 +411,7 @@ interface OcrResult {
 async function detectBurnedInSubsFast(
   videoPath: string,
   tmpDir: string,
-  maxFrames = 6,
+  maxFrames = 12,
 ): Promise<boolean> {
   const duration = await getAudioDuration(videoPath);
   if (duration <= 0) return false;
@@ -430,7 +430,9 @@ async function detectBurnedInSubsFast(
         "-i", videoPath,
         "-frames:v", "1",
         "-q:v", "5",
-        "-vf", "crop=iw:ih*0.25:0:ih*0.75", // bottom 25% only
+        // Full frame: subtitles may appear anywhere (top, middle, bottom).
+        // Downscale to keep API payload small.
+        "-vf", "scale=640:-2",
         path.join(framesDir, `detect_${String(i).padStart(2, "0")}.jpg`),
       ]).catch(() => null)
     )
@@ -466,8 +468,10 @@ async function detectBurnedInSubsFast(
             {
               type: "text",
               text:
-                "These are cropped bottom-strip frames from a video. " +
-                "Do any of them contain burned-in subtitle text or on-screen captions? " +
+                "These are frames from a video. " +
+                "Do any of them contain burned-in subtitle text or on-screen caption text " +
+                "(text overlay anywhere on the frame — top, middle, or bottom — that looks like " +
+                "spoken-content captions, not logos or watermarks)? " +
                 "Reply with ONLY 'yes' or 'no'.",
             },
           ],
