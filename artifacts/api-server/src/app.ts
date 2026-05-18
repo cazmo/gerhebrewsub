@@ -11,7 +11,7 @@ import router from "./routes/index.js";
 import { logger } from "./lib/logger.js";
 import { appRouter } from "./trpcRouter.js";
 import { getJobById } from "./db.js";
-import { gcsBucket, gcsUpload, saveGlobalCookies } from "./gcsHelper.js";
+import { gcsBucket, gcsUpload, gcsSignedGetUrl, saveGlobalCookies } from "./gcsHelper.js";
 import { getCapture, setJobId, createSetupCapture, markSetupComplete } from "./captureStore.js";
 import { createYouTubeJob } from "./pipeline.js";
 
@@ -271,15 +271,26 @@ app.get("/api/download/:jobId", async (req, res) => {
       return;
     }
     const filename = `video-subtitled-${req.params.jobId.slice(0, 8)}.mp4`;
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    const file = gcsBucket().file(job.outputKey);
-    file.createReadStream()
-      .on("error", (streamErr) => {
-        logger.error({ err: streamErr }, "GCS download error");
-        if (!res.headersSent) res.status(500).json({ error: "שגיאה בהורדה" });
-      })
-      .pipe(res);
+    try {
+      // Redirect directly to GCS signed URL — bypasses proxy size limits
+      const url = await gcsSignedGetUrl(
+        job.outputKey,
+        3600,
+        `attachment; filename="${filename}"`,
+      );
+      res.redirect(302, url);
+    } catch {
+      // Fallback: stream through server
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      gcsBucket().file(job.outputKey)
+        .createReadStream()
+        .on("error", (streamErr) => {
+          logger.error({ err: streamErr }, "GCS download error");
+          if (!res.headersSent) res.status(500).json({ error: "שגיאה בהורדה" });
+        })
+        .pipe(res);
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "שגיאה";
     res.status(500).json({ error: msg });
@@ -293,30 +304,35 @@ app.get("/api/stream/:jobId", async (req, res) => {
       res.status(404).json({ error: "סרטון לא נמצא" });
       return;
     }
-    const file = gcsBucket().file(job.outputKey);
-    const [metadata] = await file.getMetadata();
-    const fileSize = Number(metadata.size ?? 0);
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Accept-Ranges", "bytes");
-
-    const rangeHeader = req.headers.range;
-    if (rangeHeader && fileSize > 0) {
-      const parts = rangeHeader.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
-      res.status(206);
-      res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-      res.setHeader("Content-Length", chunkSize);
-      file.createReadStream({ start, end })
-        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
-        .pipe(res);
-    } else {
-      if (fileSize > 0) res.setHeader("Content-Length", fileSize);
-      file.createReadStream()
-        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
-        .pipe(res);
+    try {
+      // Redirect to GCS signed URL — browser handles range requests directly
+      const url = await gcsSignedGetUrl(job.outputKey, 3600);
+      res.redirect(302, url);
+    } catch {
+      // Fallback: proxy with range request support
+      const file = gcsBucket().file(job.outputKey);
+      const [metadata] = await file.getMetadata();
+      const fileSize = Number(metadata.size ?? 0);
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Accept-Ranges", "bytes");
+      const rangeHeader = req.headers.range;
+      if (rangeHeader && fileSize > 0) {
+        const parts = rangeHeader.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunkSize = end - start + 1;
+        res.status(206);
+        res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+        res.setHeader("Content-Length", chunkSize);
+        file.createReadStream({ start, end })
+          .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
+          .pipe(res);
+      } else {
+        if (fileSize > 0) res.setHeader("Content-Length", fileSize);
+        file.createReadStream()
+          .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
+          .pipe(res);
+      }
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "שגיאה";

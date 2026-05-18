@@ -71,6 +71,20 @@ export async function deleteGlobalCookies(): Promise<void> {
   }
 }
 
+export async function gcsSignedGetUrl(
+  key: string,
+  expiresInSeconds = 3600,
+  contentDisposition?: string,
+): Promise<string> {
+  const [url] = await gcsBucket().file(key).getSignedUrl({
+    version: "v4",
+    action: "read",
+    expires: Date.now() + expiresInSeconds * 1000,
+    ...(contentDisposition ? { responseDisposition: contentDisposition } : {}),
+  });
+  return url;
+}
+
 export async function gcsSignedPutUrl(
   key: string,
   contentType: string,

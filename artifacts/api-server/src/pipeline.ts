@@ -665,6 +665,7 @@ async function embedSubtitles(
     "-vf", vfParts.join(","),
     "-c:a", "copy",
     "-preset", "fast",
+    "-movflags", "+faststart",
     outputPath,
   ]);
 }
