@@ -6,7 +6,7 @@ import { promisify } from "util";
 import { nanoid } from "nanoid";
 import OpenAI from "openai";
 import { createJob, getJobById, insertSegments, updateJob } from "./db.js";
-import { gcsDownload, gcsUpload, gcsBucket, loadGlobalCookies } from "./gcsHelper.js";
+import { gcsDownload, gcsUpload, gcsBucket, gcsEnsurePublic, loadGlobalCookies } from "./gcsHelper.js";
 import { logger } from "./lib/logger.js";
 import type { InsertJobSegment } from "@workspace/db";
 
@@ -848,6 +848,7 @@ export async function runPipeline(jobId: string): Promise<void> {
         gcsUpload(srtKey, Buffer.from(srtContent, "utf8"), "text/plain"),
       ]);
       await gcsUpload(outputKey, outputBuffer, "video/mp4");
+      await gcsEnsurePublic(outputKey);
 
       await updateJob(jobId, { status: "completed", outputKey, srtKey });
     } catch (err: unknown) {

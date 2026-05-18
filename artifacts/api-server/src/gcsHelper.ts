@@ -35,6 +35,21 @@ export async function gcsUpload(
   await gcsBucket().file(key).save(data, { contentType, resumable: false });
 }
 
+export function gcsPublicUrl(key: string): string {
+  const bucketId = getBucketId();
+  return `https://storage.googleapis.com/${bucketId}/${key}`;
+}
+
+/** Returns true if the file was made public successfully, false otherwise. */
+export async function gcsEnsurePublic(key: string): Promise<boolean> {
+  try {
+    await gcsBucket().file(key).makePublic();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function gcsDownload(key: string): Promise<Buffer> {
   const [buf] = await gcsBucket().file(key).download();
   return buf as Buffer;

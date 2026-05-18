@@ -294,14 +294,13 @@ export default function JobStatus() {
               <VideoPreview jobId={id!} />
 
               {/* Download buttons */}
-              <a
-                href={`/api/download/${id}`}
-                download
+              <button
+                onClick={() => window.open(`/api/download/${id}`, "_blank")}
                 className="flex items-center justify-center gap-2 w-full py-3 px-4 rounded-xl bg-primary text-primary-foreground font-semibold text-sm hover:opacity-90 transition-all"
               >
                 <Download size={16} />
                 הורד סרטון עם כתוביות
-              </a>
+              </button>
 
               {hasSrt && (
                 <a
