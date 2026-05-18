@@ -172,6 +172,36 @@ const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600;
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
+// ─── SRT parser (for transcription response_format:"srt") ────────────────────
+
+function srtTimeToSeconds(t: string): number {
+  // format: HH:MM:SS,mmm
+  const [hms, ms] = t.trim().split(",");
+  const [h, m, s] = (hms ?? "").split(":").map(Number);
+  return (h ?? 0) * 3600 + (m ?? 0) * 60 + (s ?? 0) + (parseInt(ms ?? "0", 10) / 1000);
+}
+
+function parseSrt(srt: string, startOffset = 0): WhisperSegment[] {
+  const blocks = srt.trim().split(/\n\s*\n/);
+  const segments: WhisperSegment[] = [];
+  for (const block of blocks) {
+    const lines = block.trim().split("\n");
+    if (lines.length < 2) continue;
+    // find the timecode line: "HH:MM:SS,mmm --> HH:MM:SS,mmm"
+    const timeLine = lines.find((l) => l.includes("-->"));
+    if (!timeLine) continue;
+    const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim());
+    if (!startStr || !endStr) continue;
+    const start = srtTimeToSeconds(startStr) + startOffset;
+    const end = srtTimeToSeconds(endStr) + startOffset;
+    // text is everything after the timecode line (skip the index line if numeric)
+    const textLines = lines.filter((l) => l !== timeLine && !/^\d+$/.test(l.trim()));
+    const text = textLines.join(" ").trim();
+    if (text) segments.push({ id: segments.length, start, end, text });
+  }
+  return segments;
+}
+
 // ─── Transcription ───────────────────────────────────────────────────────────
 
 interface VerboseTranscription {
@@ -192,26 +222,27 @@ async function transcribeAudioBuffer(
   const langParam = sourceLang !== "auto" ? sourceLang : undefined;
   const fileStream = createReadStream(audioPath);
 
-  // whisper-1 reliably returns per-segment timestamps via verbose_json.
-  // gpt-4o-mini-transcribe does not return segments — only a raw text blob.
-  let raw: VerboseTranscription;
+  // gpt-4o-mini-transcribe does not return segments in verbose_json.
+  // Use response_format:"srt" which embeds timestamps directly in the text.
+  let srtText: string | null = null;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    raw = (await (openai.audio.transcriptions.create as unknown as (p: unknown, o: unknown) => Promise<unknown>)(
+    srtText = (await (openai.audio.transcriptions.create as unknown as (p: unknown, o: unknown) => Promise<unknown>)(
       {
         file: fileStream,
-        model: "whisper-1",
+        model: "gpt-4o-mini-transcribe",
         ...(langParam ? { language: langParam } : {}),
-        response_format: "verbose_json",
+        response_format: "srt",
       },
       { timeout: TRANSCRIBE_TIMEOUT_MS }
-    )) as VerboseTranscription;
+    )) as string;
   } catch {
+    // fallback: json format (single segment, rough timing)
     const fileStream2 = createReadStream(audioPath);
     const fallback = await openai.audio.transcriptions.create(
       {
         file: fileStream2 as never,
-        model: "whisper-1",
+        model: "gpt-4o-mini-transcribe",
         ...(langParam ? { language: langParam } : {}),
         response_format: "json",
       },
@@ -220,24 +251,12 @@ async function transcribeAudioBuffer(
     return { segments: [{ id: 0, start: chunkStart, end: chunkStart + 1, text: fallback.text?.trim() ?? "" }], startOffset: chunkStart };
   }
 
-  if (raw.segments && raw.segments.length > 0) {
-    return {
-      segments: raw.segments.map((s, i) => ({
-        id: i,
-        start: chunkStart + s.start,
-        end: chunkStart + s.end,
-        text: s.text.trim(),
-      })),
-      startOffset: chunkStart,
-    };
+  if (srtText && typeof srtText === "string") {
+    const parsed = parseSrt(srtText, chunkStart);
+    if (parsed.length > 0) return { segments: parsed, startOffset: chunkStart };
   }
 
-  return {
-    segments: raw.text?.trim()
-      ? [{ id: 0, start: chunkStart, end: chunkStart + 1, text: raw.text.trim() }]
-      : [],
-    startOffset: chunkStart,
-  };
+  return { segments: [], startOffset: chunkStart };
 }
 
 async function transcribeWithWhisper(audioPath: string, sourceLang: string): Promise<WhisperSegment[]> {
