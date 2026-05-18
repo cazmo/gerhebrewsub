@@ -48,7 +48,7 @@ A German-to-Hebrew subtitle translator. Upload a video file or provide a YouTube
 ## Product
 
 - Upload a video file (MP4, MOV, AVI, WebM, MKV up to 500MB) or paste a YouTube URL
-- The server transcribes German audio with Whisper (`gpt-4o-mini-transcribe`), translates to Hebrew with GPT-4.1-mini, burns the subtitles in with ffmpeg, and uploads the result to GCS
+- The server transcribes audio with Whisper (`whisper-1` — returns per-segment timestamps via verbose_json), translates with GPT-4.1-mini, burns the subtitles in with ffmpeg, and uploads the result to GCS
 - The user can download the output MP4 from the job status page or history page
 
 ## User preferences

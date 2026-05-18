@@ -192,13 +192,15 @@ async function transcribeAudioBuffer(
   const langParam = sourceLang !== "auto" ? sourceLang : undefined;
   const fileStream = createReadStream(audioPath);
 
+  // whisper-1 reliably returns per-segment timestamps via verbose_json.
+  // gpt-4o-mini-transcribe does not return segments — only a raw text blob.
   let raw: VerboseTranscription;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     raw = (await (openai.audio.transcriptions.create as unknown as (p: unknown, o: unknown) => Promise<unknown>)(
       {
         file: fileStream,
-        model: "gpt-4o-mini-transcribe",
+        model: "whisper-1",
         ...(langParam ? { language: langParam } : {}),
         response_format: "verbose_json",
       },
@@ -209,7 +211,7 @@ async function transcribeAudioBuffer(
     const fallback = await openai.audio.transcriptions.create(
       {
         file: fileStream2 as never,
-        model: "gpt-4o-mini-transcribe",
+        model: "whisper-1",
         ...(langParam ? { language: langParam } : {}),
         response_format: "json",
       },
