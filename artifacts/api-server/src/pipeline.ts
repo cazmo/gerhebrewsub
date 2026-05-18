@@ -170,7 +170,8 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 15; // split audio into 15-sec pieces for timestamp accuracy
+const SUBTITLE_CHUNK_SECONDS = 6; // split audio into 6-sec pieces for tight speech-to-subtitle sync
+const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
 // ─── SRT parser (for transcription response_format:"srt") ────────────────────
@@ -251,8 +252,8 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
   const numChunks = Math.ceil(totalDuration / SUBTITLE_CHUNK_SECONDS);
   const allSegments: WhisperSegment[] = [];
 
-  // Process chunks in parallel groups of 5 to stay within rate limits
-  const PARALLEL = 5;
+  // Process chunks in parallel groups of 8 to stay within rate limits
+  const PARALLEL = 8;
   for (let g = 0; g < numChunks; g += PARALLEL) {
     const groupEnd = Math.min(g + PARALLEL, numChunks);
     const chunkPaths: string[] = [];
@@ -290,20 +291,101 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
     // Cleanup chunk files
     await Promise.all(chunkPaths.map((cp) => fs.unlink(cp).catch(() => {})));
 
-    // Build segments from non-empty transcriptions
+    // Build segments — split long chunk text into multiple sub-subtitles
     for (const { text, startSec, endSec } of texts) {
-      if (text) {
+      if (!text) continue;
+      const pieces = splitTextIntoSubtitlePieces(text, MAX_SUBTITLE_LINE_CHARS * 2).filter((p) => p.length > 0);
+      if (pieces.length === 0) continue;
+      const span = Math.max(endSec - startSec, 0.5);
+      const sliceDur = span / pieces.length;
+      for (let p = 0; p < pieces.length; p++) {
+        const subStart = startSec + p * sliceDur;
+        const subEnd = Math.min(startSec + (p + 1) * sliceDur, endSec);
+        if (subEnd - subStart < 0.2) continue; // skip impossibly short slices
         allSegments.push({
           id: allSegments.length,
-          start: startSec,
-          end: endSec,
-          text,
+          start: subStart,
+          end: subEnd,
+          text: pieces[p],
         });
       }
     }
   }
 
   return allSegments;
+}
+
+/**
+ * Split a long string into subtitle-sized pieces, breaking at sentence/clause
+ * boundaries when possible. Each piece is ≤ maxChars characters.
+ */
+function splitTextIntoSubtitlePieces(text: string, maxChars: number): string[] {
+  const clean = text.trim().replace(/\s+/g, " ");
+  if (clean.length <= maxChars) return [clean];
+
+  const pieces: string[] = [];
+  // Break at sentence boundaries first
+  const sentences = clean.split(/(?<=[.!?。！？])\s+/);
+  let current = "";
+  for (const s of sentences) {
+    if (s.length > maxChars) {
+      // Sentence itself too long → split further by commas or words
+      if (current) { pieces.push(current); current = ""; }
+      const parts = splitByCommaOrWords(s, maxChars);
+      pieces.push(...parts);
+      continue;
+    }
+    if (!current) { current = s; continue; }
+    if ((current + " " + s).length <= maxChars) {
+      current += " " + s;
+    } else {
+      pieces.push(current);
+      current = s;
+    }
+  }
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+function splitByCommaOrWords(text: string, maxChars: number): string[] {
+  const pieces: string[] = [];
+  const segs = text.split(/(?<=[,،;:])\s+/);
+  let current = "";
+  for (const s of segs) {
+    if (s.length > maxChars) {
+      if (current) { pieces.push(current); current = ""; }
+      // Hard word-split, with final fallback hard-slicing oversized tokens
+      const words = s.split(" ");
+      let buf = "";
+      for (const w of words) {
+        // If a single word is longer than maxChars, hard-slice it
+        if (w.length > maxChars) {
+          if (buf) { pieces.push(buf.trim()); buf = ""; }
+          for (let i = 0; i < w.length; i += maxChars) {
+            pieces.push(w.slice(i, i + maxChars));
+          }
+          continue;
+        }
+        if ((buf + " " + w).trim().length > maxChars) {
+          if (buf) pieces.push(buf.trim());
+          buf = w;
+        } else {
+          buf = (buf ? buf + " " : "") + w;
+        }
+      }
+      if (buf) pieces.push(buf.trim());
+      continue;
+    }
+    if (!current) { current = s; continue; }
+    if ((current + " " + s).length <= maxChars) {
+      current += " " + s;
+    } else {
+      pieces.push(current);
+      current = s;
+    }
+  }
+  if (current) pieces.push(current);
+  return pieces;
 }
 
 // ─── OCR for burned-in subtitles ─────────────────────────────────────────────
@@ -668,25 +750,34 @@ async function embedSubtitles(
   const escapedSrt = srtPath
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'");
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
 
   const alignment = position === "top" ? 8 : 2;
+  // BorderStyle=4 → opaque box background (BackColour) drawn behind text
   const style = [
     "FontName=DejaVu Sans",
-    "FontSize=26",
+    "FontSize=24",
     `Alignment=${alignment}`,
-    "MarginV=35",
+    "MarginV=40",
+    "MarginL=40",
+    "MarginR=40",
     "PrimaryColour=&H00FFFFFF",
     "OutlineColour=&H00000000",
-    "BackColour=&H80000000",
-    "Outline=2",
-    "Shadow=1",
+    "BackColour=&HCC000000",
+    "BorderStyle=4",
+    "Outline=8",
+    "Shadow=0",
     "Bold=0",
   ].join(",");
 
   const vfParts: string[] = [];
   if (coverOriginalSubs) {
-    vfParts.push("drawbox=x=0:y=ih*0.83:w=iw:h=ih*0.17:color=black:t=fill");
+    // Cover bottom ~28% to reliably erase burned-in subtitles regardless of
+    // where they're positioned. Top-positioned new subs are unaffected.
+    vfParts.push("drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black:t=fill");
   }
   vfParts.push(`subtitles=${escapedSrt}:force_style='${style}'`);
 
