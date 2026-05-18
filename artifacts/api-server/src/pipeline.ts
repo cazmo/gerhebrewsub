@@ -12,6 +12,96 @@ import type { InsertJobSegment } from "@workspace/db";
 
 const execFileAsync = promisify(execFile);
 
+// ─── Language helpers ────────────────────────────────────────────────────────
+
+export const SUPPORTED_LANGS: Record<string, string> = {
+  auto: "זיהוי אוטומטי",
+  he: "עברית",
+  de: "גרמנית",
+  en: "אנגלית",
+  fr: "צרפתית",
+  es: "ספרדית",
+  ar: "ערבית",
+  ru: "רוסית",
+  uk: "אוקראינית",
+  it: "איטלקית",
+  pt: "פורטוגלית",
+  pl: "פולנית",
+  nl: "הולנדית",
+  tr: "טורקית",
+  zh: "סינית",
+  ja: "יפנית",
+  ko: "קוריאנית",
+  ro: "רומנית",
+  hu: "הונגרית",
+  cs: "צ'כית",
+  sv: "שוודית",
+};
+
+export const LANG_NAMES_EN: Record<string, string> = {
+  auto: "auto-detected",
+  he: "Hebrew",
+  de: "German",
+  en: "English",
+  fr: "French",
+  es: "Spanish",
+  ar: "Arabic",
+  ru: "Russian",
+  uk: "Ukrainian",
+  it: "Italian",
+  pt: "Portuguese",
+  pl: "Polish",
+  nl: "Dutch",
+  tr: "Turkish",
+  zh: "Chinese",
+  ja: "Japanese",
+  ko: "Korean",
+  ro: "Romanian",
+  hu: "Hungarian",
+  cs: "Czech",
+  sv: "Swedish",
+};
+
+function langName(code: string): string {
+  return LANG_NAMES_EN[code] ?? code;
+}
+
+// ─── Subtitle formatting ─────────────────────────────────────────────────────
+
+const MAX_LINE_CHARS = 42;
+const MAX_LINES = 2;
+
+/**
+ * Wraps subtitle text into at most 2 lines of ~42 chars each,
+ * splitting at word boundaries.
+ */
+function formatSubtitleLines(text: string): string {
+  const words = text.trim().split(/\s+/);
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    if (lines.length >= MAX_LINES) break;
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length <= MAX_LINE_CHARS) {
+      current = candidate;
+    } else {
+      if (current) {
+        lines.push(current);
+        current = word;
+      } else {
+        lines.push(word.slice(0, MAX_LINE_CHARS));
+        current = "";
+      }
+    }
+  }
+  if (current && lines.length < MAX_LINES) lines.push(current);
+
+  return lines.join("\n");
+}
+
+// ─── OpenAI ──────────────────────────────────────────────────────────────────
+
 function getOpenAI(): OpenAI {
   if (!process.env.AI_INTEGRATIONS_OPENAI_API_KEY || !process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) {
     throw new Error("OpenAI AI integration env vars not set");
@@ -22,6 +112,8 @@ function getOpenAI(): OpenAI {
   });
 }
 
+// ─── Temp dir ────────────────────────────────────────────────────────────────
+
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gerhebrewsub-"));
   try {
@@ -30,6 +122,8 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
+
+// ─── SRT builder ─────────────────────────────────────────────────────────────
 
 function secondsToSrtTime(s: number): string {
   const h = Math.floor(s / 3600);
@@ -43,10 +137,15 @@ function buildSrt(
   segments: Array<{ startTime: number; endTime: number; translatedText: string | null }>
 ): string {
   return segments
-    .filter((s) => s.translatedText)
-    .map((s, i) => `${i + 1}\n${secondsToSrtTime(s.startTime)} --> ${secondsToSrtTime(s.endTime)}\n${s.translatedText}\n`)
+    .filter((s) => s.translatedText?.trim())
+    .map((s, i) => {
+      const formatted = formatSubtitleLines(s.translatedText!);
+      return `${i + 1}\n${secondsToSrtTime(s.startTime)} --> ${secondsToSrtTime(s.endTime)}\n${formatted}\n`;
+    })
     .join("\n");
 }
+
+// ─── Audio helpers ───────────────────────────────────────────────────────────
 
 interface WhisperSegment {
   id: number;
@@ -67,11 +166,13 @@ async function getAudioDuration(audioPath: string): Promise<number> {
   }
 }
 
-const MAX_VIDEO_DURATION_SEC = 110 * 60; // 110 minutes
-const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024; // 500 MB
+const MAX_VIDEO_DURATION_SEC = 110 * 60;
+const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600;
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
+
+// ─── Transcription ───────────────────────────────────────────────────────────
 
 interface VerboseTranscription {
   text: string;
@@ -81,25 +182,37 @@ interface VerboseTranscription {
 async function transcribeAudioBuffer(
   openai: OpenAI,
   audioPath: string,
-  chunkStart: number
+  chunkStart: number,
+  sourceLang: string,
 ): Promise<{ segments: WhisperSegment[]; startOffset: number }> {
   const { createReadStream, statSync } = await import("fs");
   const size = statSync(audioPath).size;
   if (size === 0) return { segments: [], startOffset: chunkStart };
 
+  const langParam = sourceLang !== "auto" ? sourceLang : undefined;
   const fileStream = createReadStream(audioPath);
 
   let raw: VerboseTranscription;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     raw = (await (openai.audio.transcriptions.create as unknown as (p: unknown, o: unknown) => Promise<unknown>)(
-      { file: fileStream, model: "gpt-4o-mini-transcribe", language: "de", response_format: "verbose_json" },
+      {
+        file: fileStream,
+        model: "gpt-4o-mini-transcribe",
+        ...(langParam ? { language: langParam } : {}),
+        response_format: "verbose_json",
+      },
       { timeout: TRANSCRIBE_TIMEOUT_MS }
     )) as VerboseTranscription;
   } catch {
     const fileStream2 = createReadStream(audioPath);
     const fallback = await openai.audio.transcriptions.create(
-      { file: fileStream2 as never, model: "gpt-4o-mini-transcribe", language: "de", response_format: "json" },
+      {
+        file: fileStream2 as never,
+        model: "gpt-4o-mini-transcribe",
+        ...(langParam ? { language: langParam } : {}),
+        response_format: "json",
+      },
       { timeout: TRANSCRIBE_TIMEOUT_MS }
     );
     return { segments: [{ id: 0, start: chunkStart, end: chunkStart + 1, text: fallback.text?.trim() ?? "" }], startOffset: chunkStart };
@@ -125,7 +238,7 @@ async function transcribeAudioBuffer(
   };
 }
 
-async function transcribeWithWhisper(audioPath: string): Promise<WhisperSegment[]> {
+async function transcribeWithWhisper(audioPath: string, sourceLang: string): Promise<WhisperSegment[]> {
   const openai = getOpenAI();
   const { statSync } = await import("fs");
   const audioSize = statSync(audioPath).size;
@@ -134,7 +247,7 @@ async function transcribeWithWhisper(audioPath: string): Promise<WhisperSegment[
   const allSegments: WhisperSegment[] = [];
 
   if (audioSize <= MAX_AUDIO_BYTES) {
-    const { segments } = await transcribeAudioBuffer(openai, audioPath, 0);
+    const { segments } = await transcribeAudioBuffer(openai, audioPath, 0, sourceLang);
     allSegments.push(...segments);
   } else {
     const numChunks = Math.ceil(totalDuration / CHUNK_SECONDS);
@@ -152,7 +265,7 @@ async function transcribeWithWhisper(audioPath: string): Promise<WhisperSegment[
           "-acodec", "copy",
           chunkPath,
         ]);
-        const { segments } = await transcribeAudioBuffer(openai, chunkPath, startSec);
+        const { segments } = await transcribeAudioBuffer(openai, chunkPath, startSec, sourceLang);
         allSegments.push(...segments);
       } finally {
         fs.unlink(chunkPath).catch(() => {});
@@ -163,7 +276,14 @@ async function transcribeWithWhisper(audioPath: string): Promise<WhisperSegment[
   return allSegments.map((s, i) => ({ ...s, id: i }));
 }
 
-async function extractTextViaOcr(videoPath: string, tmpDir: string): Promise<WhisperSegment[]> {
+// ─── OCR for burned-in subtitles ─────────────────────────────────────────────
+
+interface OcrResult {
+  segments: WhisperSegment[];
+  hasBurnedInSubs: boolean;
+}
+
+async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: string): Promise<OcrResult> {
   const framesDir = path.join(tmpDir, "frames");
   await fs.mkdir(framesDir);
   await execFileAsync("ffmpeg", [
@@ -174,10 +294,12 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string): Promise<Whi
   ]);
 
   const frameFiles = (await fs.readdir(framesDir)).sort();
-  if (frameFiles.length === 0) return [];
+  if (frameFiles.length === 0) return { segments: [], hasBurnedInSubs: false };
 
   const openai = getOpenAI();
   const segments: WhisperSegment[] = [];
+  let burnedSubCount = 0;
+  const targetLangName = langName(targetLang);
 
   for (let i = 0; i < frameFiles.length; i++) {
     const framePath = path.join(framesDir, frameFiles[i]);
@@ -196,7 +318,11 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string): Promise<Whi
               { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
               {
                 type: "text",
-                text: "Extract any German spoken text or subtitles visible in this video frame. Return only the text, nothing else. If no text, return empty string.",
+                text:
+                  `Look at the bottom portion of this video frame for any burned-in subtitles or on-screen text. ` +
+                  `If you find subtitle text, translate it to ${targetLangName} and return ONLY the translated subtitle text. ` +
+                  `If there are no subtitles or on-screen text, return an empty string. ` +
+                  `Do NOT describe the image. Do NOT add explanations. Only return the translated text or empty string.`,
               },
             ],
           },
@@ -204,13 +330,22 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string): Promise<Whi
         max_tokens: 200,
       });
       const text = (res.choices[0]?.message?.content ?? "").trim();
-      if (text) segments.push({ id: i, start: frameTime, end: frameTime + 5, text });
+      if (text) {
+        segments.push({ id: i, start: frameTime, end: frameTime + 5, text });
+        burnedSubCount++;
+      }
     } catch {
       // skip frame on error
     }
   }
-  return segments;
+
+  return {
+    segments,
+    hasBurnedInSubs: burnedSubCount > frameFiles.length * 0.1,
+  };
 }
+
+// ─── Translation ─────────────────────────────────────────────────────────────
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
 const TRANSLATE_BATCH = 15;
@@ -228,13 +363,22 @@ function parseTranslationLines(raw: string, expected: number): string[] | null {
   return null;
 }
 
-async function translateBatch(openai: OpenAI, batch: WhisperSegment[], batchLabel: string): Promise<string[]> {
+async function translateBatch(
+  openai: OpenAI,
+  batch: WhisperSegment[],
+  sourceLang: string,
+  targetLang: string,
+  batchLabel: string,
+): Promise<string[]> {
   const numbered = batch.map((s, idx) => `${idx + 1}. ${s.text}`).join("\n");
+  const srcName = langName(sourceLang);
+  const tgtName = langName(targetLang);
   const systemPrompt =
-    "You are a professional German-to-Hebrew translator. " +
-    `Translate the following ${batch.length} numbered lines from German to Hebrew. ` +
-    "Return EXACTLY one translated line per input line, in the same order, with the same numbering (1. 2. 3. ...). " +
-    "Each translation must be on its own separate line. Do NOT merge lines or add commentary.";
+    `You are a professional subtitle translator. ` +
+    `Translate the following ${batch.length} numbered subtitle lines from ${srcName} to ${tgtName}. ` +
+    `Return EXACTLY one translated line per input line, in the same order, with the same numbering (1. 2. 3. ...). ` +
+    `Each translation must be on its own separate line. Do NOT merge lines or add commentary. ` +
+    `Keep translations concise — subtitles must be short and readable.`;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const response = await openai.chat.completions.create(
@@ -265,7 +409,10 @@ async function translateBatch(openai: OpenAI, batch: WhisperSegment[], batchLabe
         {
           model: "gpt-4.1-mini",
           messages: [
-            { role: "system", content: "Translate the following German text to Hebrew. Return only the translation." },
+            {
+              role: "system",
+              content: `Translate the following subtitle text to ${langName(targetLang)}. Return only the translation.`,
+            },
             { role: "user", content: seg.text },
           ],
           max_tokens: 200,
@@ -281,20 +428,26 @@ async function translateBatch(openai: OpenAI, batch: WhisperSegment[], batchLabe
   return individual;
 }
 
-async function translateToHebrew(segments: WhisperSegment[]): Promise<string[]> {
+async function translateSegments(
+  segments: WhisperSegment[],
+  sourceLang: string,
+  targetLang: string,
+): Promise<string[]> {
   const results: string[] = new Array(segments.length).fill("");
   const openai = getOpenAI();
 
   for (let i = 0; i < segments.length; i += TRANSLATE_BATCH) {
     const batch = segments.slice(i, i + TRANSLATE_BATCH);
     const batchLabel = `batch ${Math.floor(i / TRANSLATE_BATCH) + 1}`;
-    const translations = await translateBatch(openai, batch, batchLabel);
+    const translations = await translateBatch(openai, batch, sourceLang, targetLang, batchLabel);
     for (let j = 0; j < batch.length; j++) {
       results[i + j] = translations[j] ?? batch[j].text;
     }
   }
   return results;
 }
+
+// ─── Video helpers ───────────────────────────────────────────────────────────
 
 async function hasAudioStream(videoPath: string): Promise<boolean> {
   try {
@@ -374,7 +527,19 @@ async function downloadYouTube(url: string, outputPath: string, cookiesPath?: st
   throw lastError ?? new Error("YouTube download failed");
 }
 
-async function embedSubtitles(videoPath: string, srtPath: string, outputPath: string): Promise<void> {
+// ─── Subtitle embedding ───────────────────────────────────────────────────────
+
+/**
+ * Embeds subtitles into the video.
+ * When coverOriginalSubs=true, a black bar is drawn over the bottom 15% of the
+ * frame to erase burned-in subtitles before the translated ones are applied.
+ */
+async function embedSubtitles(
+  videoPath: string,
+  srtPath: string,
+  outputPath: string,
+  coverOriginalSubs: boolean,
+): Promise<void> {
   const escapedSrt = srtPath
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
@@ -393,18 +558,29 @@ async function embedSubtitles(videoPath: string, srtPath: string, outputPath: st
     "Bold=0",
   ].join(",");
 
+  const vfParts: string[] = [];
+  if (coverOriginalSubs) {
+    vfParts.push("drawbox=x=0:y=ih*0.83:w=iw:h=ih*0.17:color=black:t=fill");
+  }
+  vfParts.push(`subtitles=${escapedSrt}:force_style='${style}'`);
+
   await execFileAsync("ffmpeg", [
     "-y", "-i", videoPath,
-    "-vf", `subtitles=${escapedSrt}:force_style='${style}'`,
+    "-vf", vfParts.join(","),
     "-c:a", "copy",
     "-preset", "fast",
     outputPath,
   ]);
 }
 
+// ─── Main pipeline ────────────────────────────────────────────────────────────
+
 export async function runPipeline(jobId: string): Promise<void> {
   const job = await getJobById(jobId);
   if (!job) throw new Error(`Job ${jobId} not found`);
+
+  const sourceLang = job.sourceLang ?? "auto";
+  const targetLang = job.targetLang ?? "he";
 
   await withTempDir(async (tmpDir) => {
     let currentStatus: "pending" | "uploading" | "transcribing" | "translating" | "embedding" = "pending";
@@ -441,7 +617,6 @@ export async function runPipeline(jobId: string): Promise<void> {
           }
         }
 
-        // Check YouTube duration before downloading
         const ytDuration = await getYouTubeDurationSec(job.inputUrl!, cookiesPath);
         if (ytDuration > 0 && ytDuration > MAX_VIDEO_DURATION_SEC) {
           const mins = Math.round(ytDuration / 60);
@@ -451,7 +626,6 @@ export async function runPipeline(jobId: string): Promise<void> {
         await downloadYouTube(job.inputUrl!, videoPath, cookiesPath);
       } else {
         if (job.localPath) {
-          // Check file size before copying
           const { statSync } = await import("fs");
           const stat = statSync(job.localPath);
           if (stat.size > MAX_VIDEO_SIZE_BYTES) {
@@ -470,32 +644,58 @@ export async function runPipeline(jobId: string): Promise<void> {
         }
       }
 
-      // Validate video duration after it's available locally
       const videoDuration = await getAudioDuration(videoPath);
       if (videoDuration > 0 && videoDuration > MAX_VIDEO_DURATION_SEC) {
         const mins = Math.round(videoDuration / 60);
         throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 110 דקות.`);
       }
 
+      // ── Transcribing ────────────────────────────────────────────────────────
       await advance("transcribing");
       let whisperSegments: WhisperSegment[] = [];
+      let hasBurnedInSubs = false;
 
       if (await hasAudioStream(videoPath)) {
         const audioPath = path.join(tmpDir, "audio.mp3");
         await extractAudio(videoPath, audioPath);
-        whisperSegments = await transcribeWithWhisper(audioPath);
+        whisperSegments = await transcribeWithWhisper(audioPath, sourceLang);
+      }
+
+      // If no audio found, fall back to OCR of burned-in subtitles
+      if (whisperSegments.length === 0) {
+        const ocrResult = await extractTextViaOcr(videoPath, tmpDir, targetLang);
+        whisperSegments = ocrResult.segments;
+        hasBurnedInSubs = ocrResult.hasBurnedInSubs;
+        // OCR already returns translated text, so we skip the translation step
+        if (hasBurnedInSubs && whisperSegments.length > 0) {
+          await updateJob(jobId, { hasBurnedInSubs: true });
+        }
+      } else {
+        // Even if audio exists, check for burned-in subs in background to decide
+        // whether to cover them when embedding. We use a quick frame sample.
+        try {
+          const quickOcr = await extractTextViaOcr(videoPath, tmpDir, targetLang);
+          hasBurnedInSubs = quickOcr.hasBurnedInSubs;
+          if (hasBurnedInSubs) await updateJob(jobId, { hasBurnedInSubs: true });
+        } catch {
+          // non-critical — proceed without covering
+        }
       }
 
       if (whisperSegments.length === 0) {
-        whisperSegments = await extractTextViaOcr(videoPath, tmpDir);
+        throw new Error("לא נמצא תוכן דיבור או כתוביות בסרטון");
       }
 
-      if (whisperSegments.length === 0) {
-        throw new Error("לא נמצא תוכן דיבור בסרטון");
-      }
-
+      // ── Translating ─────────────────────────────────────────────────────────
       await advance("translating");
-      const translations = await translateToHebrew(whisperSegments);
+      let translations: string[];
+
+      // If OCR already returned translated text, use it directly
+      if (hasBurnedInSubs && !(await hasAudioStream(videoPath))) {
+        translations = whisperSegments.map((s) => s.text);
+      } else {
+        translations = await translateSegments(whisperSegments, sourceLang, targetLang);
+      }
 
       const segmentRows: InsertJobSegment[] = whisperSegments.map((s, i) => ({
         jobId,
@@ -507,6 +707,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       }));
       await insertSegments(segmentRows);
 
+      // ── Embedding ───────────────────────────────────────────────────────────
       await advance("embedding");
       const srtContent = buildSrt(
         segmentRows.map((s) => ({
@@ -519,7 +720,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       await fs.writeFile(srtPath, srtContent, "utf8");
 
       const outputVideoPath = path.join(tmpDir, "output.mp4");
-      await embedSubtitles(videoPath, srtPath, outputVideoPath);
+      await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs);
 
       const outputKey = `outputs/${jobId}/${nanoid(8)}.mp4`;
       const outputBuffer = await fs.readFile(outputVideoPath);
@@ -533,11 +734,15 @@ export async function runPipeline(jobId: string): Promise<void> {
   });
 }
 
+// ─── Job creators ─────────────────────────────────────────────────────────────
+
 export async function createFileJob(
   fileKey: string,
   originalFilename: string,
   userId?: number,
-  localPath?: string
+  localPath?: string,
+  sourceLang = "auto",
+  targetLang = "he",
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -548,6 +753,8 @@ export async function createFileJob(
     inputKey: fileKey,
     localPath: localPath ?? null,
     originalFilename,
+    sourceLang,
+    targetLang,
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;
@@ -556,7 +763,9 @@ export async function createFileJob(
 export async function createYouTubeJob(
   url: string,
   cookiesKey: string | undefined,
-  userId?: number
+  userId?: number,
+  sourceLang = "auto",
+  targetLang = "he",
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -566,6 +775,8 @@ export async function createYouTubeJob(
     inputType: "youtube",
     inputUrl: url,
     inputKey: cookiesKey ?? null,
+    sourceLang,
+    targetLang,
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;

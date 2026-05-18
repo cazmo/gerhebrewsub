@@ -1,4 +1,4 @@
-import { pgTable, serial, varchar, text, integer, real, timestamp, pgEnum } from "drizzle-orm/pg-core";
+import { pgTable, serial, varchar, text, integer, real, timestamp, pgEnum, boolean } from "drizzle-orm/pg-core";
 
 export const jobStatusEnum = pgEnum("job_status", [
   "pending", "uploading", "transcribing", "translating", "embedding", "completed", "failed",
@@ -19,6 +19,9 @@ export const jobs = pgTable("jobs", {
   outputUrl: text("output_url"),
   errorMessage: text("error_message"),
   failedAtStatus: jobStatusEnum("failed_at_status"),
+  sourceLang: varchar("source_lang", { length: 10 }).default("auto").notNull(),
+  targetLang: varchar("target_lang", { length: 10 }).default("he").notNull(),
+  hasBurnedInSubs: boolean("has_burned_in_subs").default(false),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

@@ -2,11 +2,13 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import { getJobById, listJobs } from "./db.js";
-import { createFileJob, createYouTubeJob } from "./pipeline.js";
+import { createFileJob, createYouTubeJob, SUPPORTED_LANGS } from "./pipeline.js";
 import { gcsUpload, gcsSignedPutUrl, globalCookiesExist, deleteGlobalCookies } from "./gcsHelper.js";
 import { createCapture, createSetupCapture, getCapture, isSetupComplete, setJobId } from "./captureStore.js";
 
 const t = initTRPC.create();
+
+const langCodeSchema = z.string().regex(/^[a-z]{2,5}$/).optional();
 
 export const appRouter = t.router({
   jobs: t.router({
@@ -20,6 +22,10 @@ export const appRouter = t.router({
 
     list: t.procedure.query(async () => {
       return listJobs();
+    }),
+
+    supportedLangs: t.procedure.query(async () => {
+      return SUPPORTED_LANGS;
     }),
 
     getUploadUrl: t.procedure
@@ -42,10 +48,19 @@ export const appRouter = t.router({
           fileKey: z.string(),
           originalFilename: z.string(),
           localPath: z.string().optional(),
+          sourceLang: langCodeSchema,
+          targetLang: langCodeSchema,
         })
       )
       .mutation(async ({ input }) => {
-        const jobId = await createFileJob(input.fileKey, input.originalFilename, undefined, input.localPath);
+        const jobId = await createFileJob(
+          input.fileKey,
+          input.originalFilename,
+          undefined,
+          input.localPath,
+          input.sourceLang ?? "auto",
+          input.targetLang ?? "he",
+        );
         return { jobId };
       }),
 
@@ -54,6 +69,8 @@ export const appRouter = t.router({
         z.object({
           url: z.string().url(),
           cookiesKey: z.string().optional(),
+          sourceLang: langCodeSchema,
+          targetLang: langCodeSchema,
         })
       )
       .mutation(async ({ input }) => {
@@ -66,7 +83,13 @@ export const appRouter = t.router({
         if (!ALLOWED_HOSTS.includes(host)) {
           throw new TRPCError({ code: "BAD_REQUEST", message: "רק קישורי YouTube נתמכים" });
         }
-        const jobId = await createYouTubeJob(input.url, input.cookiesKey);
+        const jobId = await createYouTubeJob(
+          input.url,
+          input.cookiesKey,
+          undefined,
+          input.sourceLang ?? "auto",
+          input.targetLang ?? "he",
+        );
         return { jobId };
       }),
 
