@@ -569,7 +569,7 @@ async function translateBatch(
     `Translate the following ${batch.length} numbered subtitle lines from ${srcName} to ${tgtName}. ` +
     `Return EXACTLY one translated line per input line, in the same order, with the same numbering (1. 2. 3. ...). ` +
     `Each translation must be on its own separate line. Do NOT merge lines or add commentary. ` +
-    `Keep translations concise — subtitles must be short and readable.`;
+    `Keep each translation to at most 80 characters so it fits on 2 subtitle lines — rephrase concisely if needed.`;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const response = await openai.chat.completions.create(
@@ -756,27 +756,45 @@ async function embedSubtitles(
     .replace(/\]/g, "\\]");
 
   const alignment = position === "top" ? 8 : 2;
-  // BorderStyle=4 → opaque box background (BackColour) drawn behind text
-  const style = [
-    "FontName=DejaVu Sans",
-    "FontSize=29",
-    `Alignment=${alignment}`,
-    "MarginV=40",
-    "MarginL=40",
-    "MarginR=40",
-    "PrimaryColour=&H00FFFFFF",
-    "OutlineColour=&H00000000",
-    "BackColour=&HCC000000",
-    "BorderStyle=3",
-    "Outline=4",
-    "Shadow=0",
-    "Bold=0",
-  ].join(",");
+
+  // When burned-in subs detected → match classic burned-in appearance:
+  //   white text + thick black outline, NO background box, drop shadow.
+  // Otherwise → opaque black box behind text (BorderStyle=3).
+  const style = coverOriginalSubs
+    ? [
+        "FontName=DejaVu Sans",
+        "FontSize=29",
+        `Alignment=${alignment}`,
+        "MarginV=30",
+        "MarginL=40",
+        "MarginR=40",
+        "PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000",
+        "BorderStyle=1",
+        "Outline=3",
+        "Shadow=1",
+        "Bold=1",
+      ].join(",")
+    : [
+        "FontName=DejaVu Sans",
+        "FontSize=29",
+        `Alignment=${alignment}`,
+        "MarginV=40",
+        "MarginL=40",
+        "MarginR=40",
+        "PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000",
+        "BackColour=&HCC000000",
+        "BorderStyle=3",
+        "Outline=4",
+        "Shadow=0",
+        "Bold=0",
+      ].join(",");
 
   const vfParts: string[] = [];
   if (coverOriginalSubs) {
-    // Cover bottom ~28% to reliably erase burned-in subtitles regardless of
-    // where they're positioned. Top-positioned new subs are unaffected.
+    // Cover bottom ~28% to reliably erase the original burned-in subtitles.
+    // The translation will be rendered in their place with matching style.
     vfParts.push("drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black:t=fill");
   }
   vfParts.push(`subtitles=${escapedSrt}:force_style='${style}'`);
