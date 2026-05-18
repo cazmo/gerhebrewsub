@@ -892,14 +892,50 @@ function escapeAssText(s: string): string {
     .replace(/\r/g, "");
 }
 
+interface BurnedSegmentLayout {
+  start: number;
+  end: number;
+  text: string;
+  bx: number; by: number; bw: number; bh: number; // pixel bbox
+  cx: number; cy: number;                          // center
+  fontSize: number;
+  primary: string;                                 // ASS color
+}
+
+function computeBurnedSegmentLayout(
+  segments: Array<{ start: number; end: number; text: string; style?: OcrFrameStyle }>,
+  videoW: number,
+  videoH: number,
+): BurnedSegmentLayout[] {
+  const out: BurnedSegmentLayout[] = [];
+  for (const seg of segments) {
+    const text = (seg.text ?? "").trim();
+    if (!text) continue;
+    const st: OcrFrameStyle = seg.style ?? {
+      yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
+    };
+    const padY = Math.round(videoH * 0.012);
+    const padX = Math.round(videoW * 0.015);
+    const bw = Math.max(40, Math.round(st.width * videoW) + padX * 2);
+    const bh = Math.max(20, Math.round(st.height * videoH) + padY * 2);
+    const cx = Math.round(st.xCenter * videoW);
+    const cy = Math.round(st.yCenter * videoH);
+    const bx = Math.max(0, Math.min(videoW - bw, cx - Math.round(bw / 2)));
+    const by = Math.max(0, Math.min(videoH - bh, cy - Math.round(bh / 2)));
+    const fontSize = Math.max(16, Math.min(64, Math.round(st.height * videoH * 0.55)));
+    out.push({ start: seg.start, end: seg.end, text, bx, by, bw, bh, cx, cy, fontSize, primary: hexToAssColor(st.color) });
+  }
+  return out;
+}
+
 /**
  * Builds an ASS subtitle file that places each translated segment at the
- * original burned-in subtitle's position with matching size, color and an
- * opaque covering box sized to the original bbox — so the translation looks
- * as if it were burned in originally in the target language.
+ * original burned-in subtitle's position with matching size and color.
+ * The original burned text is removed separately via ffmpeg's `delogo`
+ * filter so no black cover is needed.
  */
 function buildAssFromBurnedSegments(
-  segments: Array<{ start: number; end: number; text: string; style?: OcrFrameStyle }>,
+  layout: BurnedSegmentLayout[],
   videoW: number,
   videoH: number,
 ): string {
@@ -920,50 +956,20 @@ function buildAssFromBurnedSegments(
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
 
   const events: string[] = [];
-
-  for (const seg of segments) {
-    const text = (seg.text ?? "").trim();
-    if (!text) continue;
+  for (const seg of layout) {
     const start = secondsToAssTime(seg.start);
     const end = secondsToAssTime(seg.end);
-
-    // Fallback style when OCR didn't return geometry
-    const st: OcrFrameStyle = seg.style ?? {
-      yCenter: 0.9,
-      xCenter: 0.5,
-      height: 0.06,
-      width: 0.6,
-      color: "#FFFFFF",
-    };
-
-    // bbox in pixels, with a small padding so the cover safely overlaps original
-    const padY = Math.round(videoH * 0.012);
-    const padX = Math.round(videoW * 0.015);
-    const bw = Math.max(40, Math.round(st.width * videoW) + padX * 2);
-    const bh = Math.max(20, Math.round(st.height * videoH) + padY * 2);
-    const cx = Math.round(st.xCenter * videoW);
-    const cy = Math.round(st.yCenter * videoH);
-    const bx = Math.max(0, Math.min(videoW - bw, cx - Math.round(bw / 2)));
-    const by = Math.max(0, Math.min(videoH - bh, cy - Math.round(bh / 2)));
-
-    // Font size scaled to original subtitle height (line height ~ font size)
-    // Lines may wrap to 2; size by per-line height ≈ bbox height / 2.
-    const fontSize = Math.max(16, Math.min(64, Math.round(st.height * videoH * 0.55)));
-
-    const primary = hexToAssColor(st.color);
-
-    // Translated text: white-ish text matching original color, centered
-    //    at the original bbox center. \an5 = middle-center align of \pos.
-    //    Hebrew/RTL is rendered correctly by libass for RTL scripts.
-    const wrapped = formatSubtitleLines(text);
+    const wrapped = formatSubtitleLines(seg.text);
     const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
     const textOverride =
-      `{\\an5\\pos(${cx},${cy})\\fs${fontSize}\\c${primary}\\3c&H000000&\\bord2\\shad1\\b1}`;
+      `{\\an5\\pos(${seg.cx},${seg.cy})\\fs${seg.fontSize}\\c${seg.primary}\\3c&H000000&\\bord2\\shad1\\b1}`;
     events.push(
       `Dialogue: 1,${start},${end},Default,,0,0,0,,${textOverride}${safe}`,
     );
   }
 
+  // Silence unused-param lint (kept for header sizing)
+  void videoW; void videoH;
   return header + events.join("\n") + "\n";
 }
 
@@ -979,6 +985,7 @@ async function embedSubtitles(
   outputPath: string,
   coverOriginalSubs: boolean,
   position: "bottom" | "top" = "bottom",
+  delogoRegions?: BurnedSegmentLayout[],
 ): Promise<void> {
   const isAss = subPath.toLowerCase().endsWith(".ass");
 
@@ -992,8 +999,23 @@ async function embedSubtitles(
 
   const vfParts: string[] = [];
 
+  // Inpaint original burned-in text regions with delogo (samples surrounding
+  // pixels). Each region is time-gated to its segment's display window.
+  if (delogoRegions && delogoRegions.length > 0) {
+    for (const r of delogoRegions) {
+      // delogo requires x>0 and y>0 (positive ints); clamp to >=1
+      const x = Math.max(1, r.bx);
+      const y = Math.max(1, r.by);
+      const w = Math.max(2, r.bw);
+      const h = Math.max(2, r.bh);
+      const s = r.start.toFixed(2);
+      const e = r.end.toFixed(2);
+      vfParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${s},${e})'`);
+    }
+  }
+
   if (isAss) {
-    // ASS already encodes per-line position, color, size, and cover box.
+    // ASS already encodes per-line position, color and size.
     vfParts.push(`subtitles=${escapedPath}`);
   } else {
     const alignment = position === "top" ? 8 : 2;
@@ -1210,7 +1232,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       // cover sized to that bbox.
       if (burnedInTranslatedAlready) {
         const { w: vidW, h: vidH } = await getVideoDimensions(videoPath);
-        const assContent = buildAssFromBurnedSegments(
+        const layout = computeBurnedSegmentLayout(
           segmentRows.map((s, i) => ({
             start: s.startTime,
             end: s.endTime,
@@ -1220,9 +1242,10 @@ export async function runPipeline(jobId: string): Promise<void> {
           vidW,
           vidH,
         );
+        const assContent = buildAssFromBurnedSegments(layout, vidW, vidH);
         const assPath = path.join(tmpDir, "subtitles.ass");
         await fs.writeFile(assPath, assContent, "utf8");
-        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition);
+        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout);
       } else {
         await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
       }
