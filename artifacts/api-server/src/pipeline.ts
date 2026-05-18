@@ -473,12 +473,15 @@ async function detectBurnedInSubsFast(
   }
 }
 
+const OCR_INTERVAL_SEC = 2; // sample frame every 2s for tight sync with burned-in subs
+const OCR_PARALLEL = 8;
+
 async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: string): Promise<OcrResult> {
   const framesDir = path.join(tmpDir, "frames");
   await fs.mkdir(framesDir, { recursive: true });
   await execFileAsync("ffmpeg", [
     "-i", videoPath,
-    "-vf", "fps=1/5",
+    "-vf", `fps=1/${OCR_INTERVAL_SEC}`,
     "-q:v", "2",
     path.join(framesDir, "frame_%04d.jpg"),
   ]);
@@ -487,51 +490,71 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
   if (frameFiles.length === 0) return { segments: [], hasBurnedInSubs: false };
 
   const openai = getOpenAI();
-  const segments: WhisperSegment[] = [];
-  let burnedSubCount = 0;
   const targetLangName = langName(targetLang);
 
-  for (let i = 0; i < frameFiles.length; i++) {
-    const framePath = path.join(framesDir, frameFiles[i]);
-    const frameBuffer = await fs.readFile(framePath);
-    const b64 = frameBuffer.toString("base64");
-    const dataUrl = `data:image/jpeg;base64,${b64}`;
-    const frameTime = i * 5;
+  // OCR + translate each frame in parallel (groups of OCR_PARALLEL)
+  const perFrame: Array<{ idx: number; text: string }> = new Array(frameFiles.length).fill(null).map((_, i) => ({ idx: i, text: "" }));
 
-    try {
-      const res = await openai.chat.completions.create({
-        model: "gpt-4.1-mini",
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
-              {
-                type: "text",
-                text:
-                  `Look at the bottom portion of this video frame for any burned-in subtitles or on-screen text. ` +
-                  `If you find subtitle text, translate it to ${targetLangName} and return ONLY the translated subtitle text. ` +
-                  `If there are no subtitles or on-screen text, return an empty string. ` +
-                  `Do NOT describe the image. Do NOT add explanations. Only return the translated text or empty string.`,
-              },
-            ],
-          },
-        ],
-        max_tokens: 200,
-      });
-      const text = (res.choices[0]?.message?.content ?? "").trim();
-      if (text) {
-        segments.push({ id: i, start: frameTime, end: frameTime + 5, text });
-        burnedSubCount++;
-      }
-    } catch {
-      // skip frame on error
-    }
+  for (let g = 0; g < frameFiles.length; g += OCR_PARALLEL) {
+    const groupEnd = Math.min(g + OCR_PARALLEL, frameFiles.length);
+    await Promise.all(
+      Array.from({ length: groupEnd - g }, (_, off) => {
+        const i = g + off;
+        return (async () => {
+          try {
+            const buf = await fs.readFile(path.join(framesDir, frameFiles[i]));
+            const dataUrl = `data:image/jpeg;base64,${buf.toString("base64")}`;
+            const res = await openai.chat.completions.create({
+              model: "gpt-4.1-mini",
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+                    {
+                      type: "text",
+                      text:
+                        `Look at this video frame. If there are burned-in subtitles or on-screen text overlays, ` +
+                        `translate them to ${targetLangName} and return ONLY the translated text (max 80 chars, ` +
+                        `no quotes, no labels). If no subtitle text is visible, return exactly the string "NONE". ` +
+                        `Do NOT describe the image.`,
+                    },
+                  ],
+                },
+              ],
+              max_tokens: 120,
+            });
+            const text = (res.choices[0]?.message?.content ?? "").trim();
+            if (text && text.toUpperCase() !== "NONE") {
+              perFrame[i].text = text;
+            }
+          } catch {
+            // skip frame on error
+          }
+        })();
+      })
+    );
   }
 
+  // Collapse adjacent frames with the same translated text into a single segment
+  // so that timing follows actual sub-display duration, not frame intervals.
+  const segments: WhisperSegment[] = [];
+  let i = 0;
+  while (i < perFrame.length) {
+    const text = perFrame[i].text;
+    if (!text) { i++; continue; }
+    let j = i + 1;
+    while (j < perFrame.length && perFrame[j].text === text) j++;
+    const start = i * OCR_INTERVAL_SEC;
+    const end = j * OCR_INTERVAL_SEC;
+    segments.push({ id: segments.length, start, end, text });
+    i = j;
+  }
+
+  const burnedSubCount = perFrame.filter((p) => p.text).length;
   return {
     segments,
-    hasBurnedInSubs: burnedSubCount > frameFiles.length * 0.1,
+    hasBurnedInSubs: burnedSubCount > perFrame.length * 0.1,
   };
 }
 
@@ -765,7 +788,7 @@ async function embedSubtitles(
         "FontName=DejaVu Sans",
         "FontSize=29",
         `Alignment=${alignment}`,
-        "MarginV=30",
+        "MarginV=15",
         "MarginL=40",
         "MarginR=40",
         "PrimaryColour=&H00FFFFFF",
@@ -774,12 +797,13 @@ async function embedSubtitles(
         "Outline=3",
         "Shadow=1",
         "Bold=1",
+        "WrapStyle=2",
       ].join(",")
     : [
         "FontName=DejaVu Sans",
         "FontSize=29",
         `Alignment=${alignment}`,
-        "MarginV=40",
+        "MarginV=20",
         "MarginL=40",
         "MarginR=40",
         "PrimaryColour=&H00FFFFFF",
@@ -789,6 +813,7 @@ async function embedSubtitles(
         "Outline=4",
         "Shadow=0",
         "Bold=0",
+        "WrapStyle=2",
       ].join(",");
 
   const vfParts: string[] = [];
@@ -891,29 +916,39 @@ export async function runPipeline(jobId: string): Promise<void> {
       let whisperSegments: WhisperSegment[] = [];
       let hasBurnedInSubs = false;
 
-      if (await hasAudioStream(videoPath)) {
+      const audioExists = await hasAudioStream(videoPath);
+      if (audioExists) {
         const audioPath = path.join(tmpDir, "audio.mp3");
         await extractAudio(videoPath, audioPath);
         whisperSegments = await transcribeWithWhisper(audioPath, sourceLang);
       }
 
-      // If no audio found, fall back to OCR of burned-in subtitles
-      if (whisperSegments.length === 0) {
-        const ocrResult = await extractTextViaOcr(videoPath, tmpDir, targetLang);
-        whisperSegments = ocrResult.segments;
-        hasBurnedInSubs = ocrResult.hasBurnedInSubs;
-        // OCR already returns translated text, so we skip the translation step
-        if (hasBurnedInSubs && whisperSegments.length > 0) {
-          await updateJob(jobId, { hasBurnedInSubs: true });
-        }
-      } else {
-        // Even if audio exists, quickly check for burned-in subs (6 frames, 1 API call)
-        // so we know whether to cover them when embedding.
-        try {
+      // Check for burned-in subs (cheap detection: 6 frames, 1 API call)
+      let burnedInTranslatedAlready = false;
+      try {
+        if (whisperSegments.length > 0) {
           hasBurnedInSubs = await detectBurnedInSubsFast(videoPath, tmpDir);
-          if (hasBurnedInSubs) await updateJob(jobId, { hasBurnedInSubs: true });
-        } catch {
-          // non-critical — proceed without covering
+        } else {
+          // No audio → assume burned-in if any text frames exist
+          hasBurnedInSubs = true;
+        }
+      } catch {
+        hasBurnedInSubs = false;
+      }
+
+      // When burned-in subs detected → OCR-translate them and use those
+      // segments as the subtitle source. The OCR timing tracks the actual
+      // on-screen subtitle display, so correlation is correct.
+      if (hasBurnedInSubs) {
+        const ocrResult = await extractTextViaOcr(videoPath, tmpDir, targetLang);
+        if (ocrResult.segments.length > 0) {
+          whisperSegments = ocrResult.segments;
+          burnedInTranslatedAlready = true; // OCR already returned target-lang text
+          hasBurnedInSubs = ocrResult.hasBurnedInSubs;
+          await updateJob(jobId, { hasBurnedInSubs: true });
+        } else if (whisperSegments.length === 0) {
+          // No audio AND no OCR text → bail out below
+          hasBurnedInSubs = false;
         }
       }
 
@@ -926,7 +961,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       let translations: string[];
 
       // If OCR already returned translated text, use it directly
-      if (hasBurnedInSubs && !(await hasAudioStream(videoPath))) {
+      if (burnedInTranslatedAlready) {
         translations = whisperSegments.map((s) => s.text);
       } else {
         translations = await translateSegments(whisperSegments, sourceLang, targetLang);
