@@ -152,6 +152,15 @@ interface WhisperSegment {
   start: number;
   end: number;
   text: string;
+  style?: OcrFrameStyle;
+}
+
+interface OcrFrameStyle {
+  yCenter: number; // 0..1
+  xCenter: number; // 0..1
+  height: number;  // 0..1
+  width: number;   // 0..1
+  color: string;   // #RRGGBB
 }
 
 async function getAudioDuration(audioPath: string): Promise<number> {
@@ -476,6 +485,65 @@ async function detectBurnedInSubsFast(
 const OCR_INTERVAL_SEC = 2; // sample frame every 2s for tight sync with burned-in subs
 const OCR_PARALLEL = 8;
 
+function findFirstJsonObject(s: string): string | null {
+  // Walks the string and returns the first balanced {...} block.
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{") { if (depth === 0) start = i; depth++; }
+    else if (c === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) return s.slice(start, i + 1);
+      if (depth < 0) { depth = 0; start = -1; }
+    }
+  }
+  return null;
+}
+
+function parseOcrJson(raw: string): { text: string; style?: OcrFrameStyle } {
+  // Be tolerant: strip code fences, find first balanced {...} JSON object
+  const cleaned = raw.replace(/```json|```/gi, "").trim();
+  let jsonStr = findFirstJsonObject(cleaned);
+  if (!jsonStr) {
+    // Fallback: treat the whole raw as plain text translation
+    const text = cleaned.replace(/^["']|["']$/g, "").trim();
+    if (!text || text.toUpperCase() === "NONE") return { text: "" };
+    return { text };
+  }
+  try {
+    const obj = JSON.parse(jsonStr) as Record<string, unknown>;
+    const text = String(obj.text ?? "").trim();
+    if (!text || text.toUpperCase() === "NONE") return { text: "" };
+    const num = (v: unknown, def: number): number => {
+      const n = typeof v === "number" ? v : parseFloat(String(v));
+      return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : def;
+    };
+    const color = typeof obj.color === "string" && /^#?[0-9a-f]{6}$/i.test(obj.color)
+      ? (obj.color.startsWith("#") ? obj.color : `#${obj.color}`).toUpperCase()
+      : "#FFFFFF";
+    const style: OcrFrameStyle = {
+      yCenter: num(obj.yCenter, 0.9),
+      xCenter: num(obj.xCenter, 0.5),
+      height: num(obj.height, 0.06),
+      width: num(obj.width, 0.6),
+      color,
+    };
+    return { text, style };
+  } catch {
+    return { text: "" };
+  }
+}
+
 async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: string): Promise<OcrResult> {
   const framesDir = path.join(tmpDir, "frames");
   await fs.mkdir(framesDir, { recursive: true });
@@ -493,7 +561,8 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
   const targetLangName = langName(targetLang);
 
   // OCR + translate each frame in parallel (groups of OCR_PARALLEL)
-  const perFrame: Array<{ idx: number; text: string }> = new Array(frameFiles.length).fill(null).map((_, i) => ({ idx: i, text: "" }));
+  const perFrame: Array<{ idx: number; text: string; style?: OcrFrameStyle }> =
+    new Array(frameFiles.length).fill(null).map((_, i) => ({ idx: i, text: "" }));
 
   for (let g = 0; g < frameFiles.length; g += OCR_PARALLEL) {
     const groupEnd = Math.min(g + OCR_PARALLEL, frameFiles.length);
@@ -510,23 +579,29 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                 {
                   role: "user",
                   content: [
-                    { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
+                    { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
                     {
                       type: "text",
                       text:
                         `Look at this video frame. If there are burned-in subtitles or on-screen text overlays, ` +
-                        `translate them to ${targetLangName} and return ONLY the translated text (max 80 chars, ` +
-                        `no quotes, no labels). If no subtitle text is visible, return exactly the string "NONE". ` +
-                        `Do NOT describe the image.`,
+                        `translate them to ${targetLangName}. Return STRICT JSON ONLY (no markdown, no commentary) ` +
+                        `with this exact shape:\n` +
+                        `{"text":"<translation, max 80 chars, no quotes>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB"}\n` +
+                        `Where yCenter/xCenter is the CENTER of the original subtitle text bounding box (normalized 0..1 ` +
+                        `to image dimensions, y=0 is top, y=1 is bottom), height/width are the bbox size normalized, ` +
+                        `and color is the dominant TEXT color of the subtitle in hex.\n` +
+                        `If there is NO subtitle text visible (ignore logos/watermarks), return exactly {"text":"NONE"}.`,
                     },
                   ],
                 },
               ],
-              max_tokens: 120,
+              max_tokens: 200,
             });
-            const text = (res.choices[0]?.message?.content ?? "").trim();
-            if (text && text.toUpperCase() !== "NONE") {
-              perFrame[i].text = text;
+            const raw = (res.choices[0]?.message?.content ?? "").trim();
+            const parsed = parseOcrJson(raw);
+            if (parsed.text) {
+              perFrame[i].text = parsed.text;
+              perFrame[i].style = parsed.style;
             }
           } catch {
             // skip frame on error
@@ -536,8 +611,9 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
     );
   }
 
-  // Collapse adjacent frames with the same translated text into a single segment
-  // so that timing follows actual sub-display duration, not frame intervals.
+  // Collapse adjacent frames with the same translated text into a single segment.
+  // For grouped frames, average the style fields so the rendered position/size
+  // is a stable mean across the segment duration.
   const segments: WhisperSegment[] = [];
   let i = 0;
   while (i < perFrame.length) {
@@ -547,7 +623,20 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
     while (j < perFrame.length && perFrame[j].text === text) j++;
     const start = i * OCR_INTERVAL_SEC;
     const end = j * OCR_INTERVAL_SEC;
-    segments.push({ id: segments.length, start, end, text });
+    const styles = perFrame.slice(i, j).map((p) => p.style).filter((s): s is OcrFrameStyle => !!s);
+    let avgStyle: OcrFrameStyle | undefined;
+    if (styles.length > 0) {
+      const avg = (k: keyof Omit<OcrFrameStyle, "color">): number =>
+        styles.reduce((acc, s) => acc + s[k], 0) / styles.length;
+      avgStyle = {
+        yCenter: avg("yCenter"),
+        xCenter: avg("xCenter"),
+        height: avg("height"),
+        width: avg("width"),
+        color: styles[0].color,
+      };
+    }
+    segments.push({ id: segments.length, start, end, text, style: avgStyle });
     i = j;
   }
 
@@ -677,6 +766,20 @@ async function translateSegments(
 
 // ─── Video helpers ───────────────────────────────────────────────────────────
 
+async function getVideoDimensions(videoPath: string): Promise<{ w: number; h: number }> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "quiet", "-print_format", "json", "-show_streams",
+      "-select_streams", "v:0", videoPath,
+    ]);
+    const parsed = JSON.parse(stdout) as { streams?: Array<{ width?: number; height?: number }> };
+    const s = parsed.streams?.[0];
+    return { w: s?.width ?? 1280, h: s?.height ?? 720 };
+  } catch {
+    return { w: 1280, h: 720 };
+  }
+}
+
 async function hasAudioStream(videoPath: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync("ffprobe", [
@@ -757,20 +860,136 @@ async function downloadYouTube(url: string, outputPath: string, cookiesPath?: st
 
 // ─── Subtitle embedding ───────────────────────────────────────────────────────
 
+function secondsToAssTime(s: number): string {
+  if (s < 0) s = 0;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s - h * 3600 - m * 60;
+  const secStr = sec.toFixed(2).padStart(5, "0"); // SS.cc
+  return `${h}:${String(m).padStart(2, "0")}:${secStr}`;
+}
+
+function hexToAssColor(hex: string): string {
+  // ASS uses &HBBGGRR& (alpha-less primary). hex = "#RRGGBB"
+  const h = hex.replace("#", "");
+  const r = h.slice(0, 2);
+  const g = h.slice(2, 4);
+  const b = h.slice(4, 6);
+  return `&H${b}${g}${r}`.toUpperCase();
+}
+
+function escapeAssText(s: string): string {
+  // Neutralize ASS override blocks, escape codes, and CR.
+  // The caller converts intentional "\n" line breaks to "\\N" AFTER this.
+  return s
+    .replace(/\\/g, "\u200B")
+    .replace(/\{/g, "(")
+    .replace(/\}/g, ")")
+    .replace(/\r/g, "");
+}
+
+/**
+ * Builds an ASS subtitle file that places each translated segment at the
+ * original burned-in subtitle's position with matching size, color and an
+ * opaque covering box sized to the original bbox — so the translation looks
+ * as if it were burned in originally in the target language.
+ */
+function buildAssFromBurnedSegments(
+  segments: Array<{ start: number; end: number; text: string; style?: OcrFrameStyle }>,
+  videoW: number,
+  videoH: number,
+): string {
+  const header =
+    "[Script Info]\n" +
+    "ScriptType: v4.00+\n" +
+    "WrapStyle: 2\n" +
+    "ScaledBorderAndShadow: yes\n" +
+    `PlayResX: ${videoW}\n` +
+    `PlayResY: ${videoH}\n` +
+    "\n" +
+    "[V4+ Styles]\n" +
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n" +
+    "Style: Default,DejaVu Sans,28,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,1,5,0,0,0,1\n" +
+    "Style: Cover,DejaVu Sans,10,&H00000000,&H00000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n" +
+    "\n" +
+    "[Events]\n" +
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+  const events: string[] = [];
+
+  for (const seg of segments) {
+    const text = (seg.text ?? "").trim();
+    if (!text) continue;
+    const start = secondsToAssTime(seg.start);
+    const end = secondsToAssTime(seg.end);
+
+    // Fallback style when OCR didn't return geometry
+    const st: OcrFrameStyle = seg.style ?? {
+      yCenter: 0.9,
+      xCenter: 0.5,
+      height: 0.06,
+      width: 0.6,
+      color: "#FFFFFF",
+    };
+
+    // bbox in pixels, with a small padding so the cover safely overlaps original
+    const padY = Math.round(videoH * 0.012);
+    const padX = Math.round(videoW * 0.015);
+    const bw = Math.max(40, Math.round(st.width * videoW) + padX * 2);
+    const bh = Math.max(20, Math.round(st.height * videoH) + padY * 2);
+    const cx = Math.round(st.xCenter * videoW);
+    const cy = Math.round(st.yCenter * videoH);
+    const bx = Math.max(0, Math.min(videoW - bw, cx - Math.round(bw / 2)));
+    const by = Math.max(0, Math.min(videoH - bh, cy - Math.round(bh / 2)));
+
+    // Font size scaled to original subtitle height (line height ~ font size)
+    // Lines may wrap to 2; size by per-line height ≈ bbox height / 2.
+    const fontSize = Math.max(16, Math.min(64, Math.round(st.height * videoH * 0.55)));
+
+    const primary = hexToAssColor(st.color);
+
+    // 1) Cover box: opaque black rectangle at the original bbox
+    //    Layer 0, drawing primitive. \an7 anchors top-left at \pos.
+    //    Use \alpha&H22& (semi-translucent) would let original peek through,
+    //    so we use fully opaque &H00&. \1c sets fill color (black).
+    const coverDraw =
+      `{\\an7\\pos(${bx},${by})\\p1\\bord0\\shad0\\1c&H000000&\\1a&H00&}` +
+      `m 0 0 l ${bw} 0 ${bw} ${bh} 0 ${bh}{\\p0}`;
+    events.push(
+      `Dialogue: 0,${start},${end},Cover,,0,0,0,,${coverDraw}`,
+    );
+
+    // 2) Translated text: white-ish text matching original color, centered
+    //    at the original bbox center. \an5 = middle-center align of \pos.
+    //    Hebrew/RTL is rendered correctly by libass for RTL scripts.
+    const wrapped = formatSubtitleLines(text);
+    const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
+    const textOverride =
+      `{\\an5\\pos(${cx},${cy})\\fs${fontSize}\\c${primary}\\3c&H000000&\\bord2\\shad1\\b1}`;
+    events.push(
+      `Dialogue: 1,${start},${end},Default,,0,0,0,,${textOverride}${safe}`,
+    );
+  }
+
+  return header + events.join("\n") + "\n";
+}
+
 /**
  * Embeds subtitles into the video.
  * position: "bottom" (default) or "top"
- * When coverOriginalSubs=true, a black bar is drawn over the bottom 15% of the
- * frame to erase burned-in subtitles before the translated ones are applied.
+ * When subPath is .ass (burned-in flow) it already contains per-segment
+ * position, style and cover boxes — no drawbox needed.
  */
 async function embedSubtitles(
   videoPath: string,
-  srtPath: string,
+  subPath: string,
   outputPath: string,
   coverOriginalSubs: boolean,
   position: "bottom" | "top" = "bottom",
 ): Promise<void> {
-  const escapedSrt = srtPath
+  const isAss = subPath.toLowerCase().endsWith(".ass");
+
+  const escapedPath = subPath
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
     .replace(/'/g, "\\'")
@@ -778,51 +997,52 @@ async function embedSubtitles(
     .replace(/\[/g, "\\[")
     .replace(/\]/g, "\\]");
 
-  const alignment = position === "top" ? 8 : 2;
-
-  // When burned-in subs detected → match classic burned-in appearance:
-  //   white text + thick black outline, NO background box, drop shadow.
-  // Otherwise → opaque black box behind text (BorderStyle=3).
-  const style = coverOriginalSubs
-    ? [
-        "FontName=DejaVu Sans",
-        "FontSize=29",
-        `Alignment=${alignment}`,
-        "MarginV=15",
-        "MarginL=40",
-        "MarginR=40",
-        "PrimaryColour=&H00FFFFFF",
-        "OutlineColour=&H00000000",
-        "BorderStyle=1",
-        "Outline=3",
-        "Shadow=1",
-        "Bold=1",
-        "WrapStyle=2",
-      ].join(",")
-    : [
-        "FontName=DejaVu Sans",
-        "FontSize=29",
-        `Alignment=${alignment}`,
-        "MarginV=20",
-        "MarginL=40",
-        "MarginR=40",
-        "PrimaryColour=&H00FFFFFF",
-        "OutlineColour=&H00000000",
-        "BackColour=&HCC000000",
-        "BorderStyle=3",
-        "Outline=4",
-        "Shadow=0",
-        "Bold=0",
-        "WrapStyle=2",
-      ].join(",");
-
   const vfParts: string[] = [];
-  if (coverOriginalSubs) {
-    // Cover bottom ~28% to reliably erase the original burned-in subtitles.
-    // The translation will be rendered in their place with matching style.
-    vfParts.push("drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black:t=fill");
+
+  if (isAss) {
+    // ASS already encodes per-line position, color, size, and cover box.
+    vfParts.push(`subtitles=${escapedPath}`);
+  } else {
+    const alignment = position === "top" ? 8 : 2;
+    const style = coverOriginalSubs
+      ? [
+          "FontName=DejaVu Sans",
+          "FontSize=29",
+          `Alignment=${alignment}`,
+          "MarginV=15",
+          "MarginL=40",
+          "MarginR=40",
+          "PrimaryColour=&H00FFFFFF",
+          "OutlineColour=&H00000000",
+          "BorderStyle=1",
+          "Outline=3",
+          "Shadow=1",
+          "Bold=1",
+          "WrapStyle=2",
+        ].join(",")
+      : [
+          "FontName=DejaVu Sans",
+          "FontSize=29",
+          `Alignment=${alignment}`,
+          "MarginV=20",
+          "MarginL=40",
+          "MarginR=40",
+          "PrimaryColour=&H00FFFFFF",
+          "OutlineColour=&H00000000",
+          "BackColour=&HCC000000",
+          "BorderStyle=3",
+          "Outline=4",
+          "Shadow=0",
+          "Bold=0",
+          "WrapStyle=2",
+        ].join(",");
+    if (coverOriginalSubs) {
+      // SRT fallback for burned-in source (rare): erase bottom strip first
+      // so the translated subtitle isn't laid over the original.
+      vfParts.push("drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black:t=fill");
+    }
+    vfParts.push(`subtitles=${escapedPath}:force_style='${style}'`);
   }
-  vfParts.push(`subtitles=${escapedSrt}:force_style='${style}'`);
 
   await execFileAsync("ffmpeg", [
     "-y", "-i", videoPath,
@@ -991,7 +1211,28 @@ export async function runPipeline(jobId: string): Promise<void> {
 
       const subtitlePosition = (job.subtitlePosition === "top" ? "top" : "bottom") as "top" | "bottom";
       const outputVideoPath = path.join(tmpDir, "output.mp4");
-      await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
+
+      // For burned-in source: build ASS that places each translation at the
+      // original subtitle's exact bbox with matching color/size and an opaque
+      // cover sized to that bbox.
+      if (burnedInTranslatedAlready) {
+        const { w: vidW, h: vidH } = await getVideoDimensions(videoPath);
+        const assContent = buildAssFromBurnedSegments(
+          segmentRows.map((s, i) => ({
+            start: s.startTime,
+            end: s.endTime,
+            text: s.translatedText ?? "",
+            style: whisperSegments[i]?.style,
+          })),
+          vidW,
+          vidH,
+        );
+        const assPath = path.join(tmpDir, "subtitles.ass");
+        await fs.writeFile(assPath, assContent, "utf8");
+        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition);
+      } else {
+        await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
+      }
 
       const outputKey = `outputs/${jobId}/${nanoid(8)}.mp4`;
       const srtKey = `outputs/${jobId}/subtitles.srt`;
