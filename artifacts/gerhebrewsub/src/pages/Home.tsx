@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useLocation } from "wouter";
 import { toast } from "sonner";
 import { trpc } from "../lib/trpc";
-import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight } from "lucide-react";
+import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight, Clipboard } from "lucide-react";
 
 type Tab = "file" | "youtube";
 
@@ -340,16 +340,35 @@ export default function Home() {
           {/* YouTube tab */}
           {tab === "youtube" && (
             <div className="space-y-3">
-              <div className="relative">
-                <Youtube size={16} className="absolute top-1/2 -translate-y-1/2 right-3 text-muted-foreground pointer-events-none" />
+              <div className="relative flex items-center">
+                <Youtube size={16} className="absolute top-1/2 -translate-y-1/2 right-3 text-muted-foreground pointer-events-none z-10" />
                 <input
                   type="url"
                   placeholder="https://www.youtube.com/watch?v=..."
                   value={youtubeUrl}
                   onChange={(e) => setYoutubeUrl(e.target.value)}
-                  className="w-full bg-input border border-border rounded-xl py-2.5 pr-9 pl-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                  className="w-full bg-input border border-border rounded-xl py-2.5 pr-9 pl-16 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                   dir="ltr"
                 />
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const text = await navigator.clipboard.readText();
+                      if (text.trim()) {
+                        setYoutubeUrl(text.trim());
+                        toast.success("הקישור הודבק");
+                      }
+                    } catch {
+                      toast.error("לא ניתן לגשת ללוח — הדבק ידנית");
+                    }
+                  }}
+                  className="absolute left-1.5 top-1/2 -translate-y-1/2 flex items-center gap-1 px-2 py-1 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground text-xs font-medium transition-all"
+                  title="הדבק קישור"
+                >
+                  <Clipboard size={12} />
+                  הדבק
+                </button>
               </div>
               <button
                 type="button"
