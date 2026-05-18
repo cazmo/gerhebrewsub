@@ -103,7 +103,7 @@ function testSubtitleFormatter() {
 async function testDurationValidation() {
   section("Duration & Size Validation");
 
-  const MAX_DUR = 110 * 60; // 6600 sec
+  const MAX_DUR = 120 * 60; // 7200 sec
 
   // Create a tiny video and verify its duration is under limit
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pipeline-test-"));
@@ -124,11 +124,11 @@ async function testDurationValidation() {
     ]);
     const dur = parseFloat((JSON.parse(stdout) as { format: { duration: string } }).format.duration);
 
-    if (dur < MAX_DUR) ok("5-second video is under 110-minute limit", `${dur.toFixed(1)}s`);
+    if (dur < MAX_DUR) ok("5-second video is under 120-minute limit", `${dur.toFixed(1)}s`);
     else fail("5-second video exceeds limit (unexpected)");
 
     // Verify limit constant
-    if (MAX_DUR === 6600) ok("MAX_VIDEO_DURATION_SEC = 6600 (110 min)");
+    if (MAX_DUR === 7200) ok("MAX_VIDEO_DURATION_SEC = 7200 (120 min)");
     else fail("MAX_VIDEO_DURATION_SEC is wrong");
 
     // Verify size check: create a fake "large" scenario

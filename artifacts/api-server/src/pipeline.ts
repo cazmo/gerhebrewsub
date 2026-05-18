@@ -166,7 +166,7 @@ async function getAudioDuration(audioPath: string): Promise<number> {
   }
 }
 
-const MAX_VIDEO_DURATION_SEC = 110 * 60;
+const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600;
@@ -638,7 +638,7 @@ export async function runPipeline(jobId: string): Promise<void> {
         const ytDuration = await getYouTubeDurationSec(job.inputUrl!, cookiesPath);
         if (ytDuration > 0 && ytDuration > MAX_VIDEO_DURATION_SEC) {
           const mins = Math.round(ytDuration / 60);
-          throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 110 דקות.`);
+          throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 120 דקות.`);
         }
 
         await downloadYouTube(job.inputUrl!, videoPath, cookiesPath);

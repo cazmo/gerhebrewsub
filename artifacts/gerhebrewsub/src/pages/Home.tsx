@@ -319,7 +319,7 @@ export default function Home() {
                   <div>
                     <Upload size={24} className="mx-auto mb-2 text-muted-foreground" />
                     <p className="text-sm text-foreground font-medium">גרור קובץ וידאו לכאן</p>
-                    <p className="text-xs text-muted-foreground mt-1">MP4, MOV, AVI, WebM, MKV · עד 500MB · עד 110 דקות</p>
+                    <p className="text-xs text-muted-foreground mt-1">MP4, MOV, AVI, WebM, MKV · עד 500MB · עד 120 דקות</p>
                   </div>
                 )}
               </div>
