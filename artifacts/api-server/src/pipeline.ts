@@ -169,7 +169,8 @@ async function getAudioDuration(audioPath: string): Promise<number> {
 const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
-const CHUNK_SECONDS = 600;
+const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
+const SUBTITLE_CHUNK_SECONDS = 15; // split audio into 15-sec pieces for timestamp accuracy
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
 // ─── SRT parser (for transcription response_format:"srt") ────────────────────
@@ -209,92 +210,100 @@ interface VerboseTranscription {
   segments?: Array<{ id: number; start: number; end: number; text: string }>;
 }
 
-async function transcribeAudioBuffer(
+/**
+ * Transcribe a single audio chunk (≤25MB) using gpt-4o-mini-transcribe with
+ * json response_format. Returns the raw text for this chunk.
+ */
+async function transcribeChunkText(
   openai: OpenAI,
   audioPath: string,
-  chunkStart: number,
   sourceLang: string,
-): Promise<{ segments: WhisperSegment[]; startOffset: number }> {
+): Promise<string> {
   const { createReadStream, statSync } = await import("fs");
   const size = statSync(audioPath).size;
-  if (size === 0) return { segments: [], startOffset: chunkStart };
+  if (size === 0) return "";
 
   const langParam = sourceLang !== "auto" ? sourceLang : undefined;
   const fileStream = createReadStream(audioPath);
 
-  // gpt-4o-mini-transcribe does not return segments in verbose_json.
-  // Use response_format:"srt" which embeds timestamps directly in the text.
-  let srtText: string | null = null;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    srtText = (await (openai.audio.transcriptions.create as unknown as (p: unknown, o: unknown) => Promise<unknown>)(
-      {
-        file: fileStream,
-        model: "gpt-4o-mini-transcribe",
-        ...(langParam ? { language: langParam } : {}),
-        response_format: "srt",
-      },
-      { timeout: TRANSCRIBE_TIMEOUT_MS }
-    )) as string;
-  } catch {
-    // fallback: json format (single segment, rough timing)
-    const fileStream2 = createReadStream(audioPath);
-    const fallback = await openai.audio.transcriptions.create(
-      {
-        file: fileStream2 as never,
-        model: "gpt-4o-mini-transcribe",
-        ...(langParam ? { language: langParam } : {}),
-        response_format: "json",
-      },
-      { timeout: TRANSCRIBE_TIMEOUT_MS }
-    );
-    return { segments: [{ id: 0, start: chunkStart, end: chunkStart + 1, text: fallback.text?.trim() ?? "" }], startOffset: chunkStart };
-  }
-
-  if (srtText && typeof srtText === "string") {
-    const parsed = parseSrt(srtText, chunkStart);
-    if (parsed.length > 0) return { segments: parsed, startOffset: chunkStart };
-  }
-
-  return { segments: [], startOffset: chunkStart };
+  const result = await openai.audio.transcriptions.create(
+    {
+      file: fileStream as never,
+      model: "gpt-4o-mini-transcribe",
+      ...(langParam ? { language: langParam } : {}),
+      response_format: "json",
+    },
+    { timeout: TRANSCRIBE_TIMEOUT_MS }
+  );
+  return result.text?.trim() ?? "";
 }
 
+/**
+ * Split audio into SUBTITLE_CHUNK_SECONDS-long pieces and transcribe each one.
+ * Each piece gets exact timestamps from its position → many timed segments.
+ */
 async function transcribeWithWhisper(audioPath: string, sourceLang: string): Promise<WhisperSegment[]> {
   const openai = getOpenAI();
-  const { statSync } = await import("fs");
-  const audioSize = statSync(audioPath).size;
   const totalDuration = await getAudioDuration(audioPath);
 
+  if (totalDuration <= 0) return [];
+
+  const numChunks = Math.ceil(totalDuration / SUBTITLE_CHUNK_SECONDS);
   const allSegments: WhisperSegment[] = [];
 
-  if (audioSize <= MAX_AUDIO_BYTES) {
-    const { segments } = await transcribeAudioBuffer(openai, audioPath, 0, sourceLang);
-    allSegments.push(...segments);
-  } else {
-    const numChunks = Math.ceil(totalDuration / CHUNK_SECONDS);
+  // Process chunks in parallel groups of 5 to stay within rate limits
+  const PARALLEL = 5;
+  for (let g = 0; g < numChunks; g += PARALLEL) {
+    const groupEnd = Math.min(g + PARALLEL, numChunks);
+    const chunkPaths: string[] = [];
 
-    for (let i = 0; i < numChunks; i++) {
-      const startSec = i * CHUNK_SECONDS;
-      const chunkDuration = Math.min(CHUNK_SECONDS, totalDuration - startSec);
-      const chunkPath = `${audioPath}.chunk${i}.mp3`;
-
-      try {
-        await execFileAsync("ffmpeg", [
+    // Extract all chunks in this group with ffmpeg in parallel
+    await Promise.all(
+      Array.from({ length: groupEnd - g }, (_, idx) => {
+        const i = g + idx;
+        const startSec = i * SUBTITLE_CHUNK_SECONDS;
+        const chunkDuration = Math.min(SUBTITLE_CHUNK_SECONDS, totalDuration - startSec);
+        const chunkPath = `${audioPath}.sub${i}.mp3`;
+        chunkPaths.push(chunkPath);
+        return execFileAsync("ffmpeg", [
           "-y", "-i", audioPath,
           "-ss", String(startSec),
           "-t", String(chunkDuration),
-          "-acodec", "copy",
+          "-acodec", "libmp3lame", "-q:a", "4",
           chunkPath,
-        ]);
-        const { segments } = await transcribeAudioBuffer(openai, chunkPath, startSec, sourceLang);
-        allSegments.push(...segments);
-      } finally {
-        fs.unlink(chunkPath).catch(() => {});
+        ]).catch(() => null);
+      })
+    );
+
+    // Transcribe all chunks in this group in parallel
+    const texts = await Promise.all(
+      chunkPaths.map((cp, idx) => {
+        const i = g + idx;
+        const startSec = i * SUBTITLE_CHUNK_SECONDS;
+        const endSec = Math.min(startSec + SUBTITLE_CHUNK_SECONDS, totalDuration);
+        return transcribeChunkText(openai, cp, sourceLang)
+          .then((text) => ({ text, startSec, endSec }))
+          .catch(() => ({ text: "", startSec, endSec }));
+      })
+    );
+
+    // Cleanup chunk files
+    await Promise.all(chunkPaths.map((cp) => fs.unlink(cp).catch(() => {})));
+
+    // Build segments from non-empty transcriptions
+    for (const { text, startSec, endSec } of texts) {
+      if (text) {
+        allSegments.push({
+          id: allSegments.length,
+          start: startSec,
+          end: endSec,
+          text,
+        });
       }
     }
   }
 
-  return allSegments.map((s, i) => ({ ...s, id: i }));
+  return allSegments;
 }
 
 // ─── OCR for burned-in subtitles ─────────────────────────────────────────────
