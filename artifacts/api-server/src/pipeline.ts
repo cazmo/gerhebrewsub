@@ -952,18 +952,7 @@ function buildAssFromBurnedSegments(
 
     const primary = hexToAssColor(st.color);
 
-    // 1) Cover box: opaque black rectangle at the original bbox
-    //    Layer 0, drawing primitive. \an7 anchors top-left at \pos.
-    //    Use \alpha&H22& (semi-translucent) would let original peek through,
-    //    so we use fully opaque &H00&. \1c sets fill color (black).
-    const coverDraw =
-      `{\\an7\\pos(${bx},${by})\\p1\\bord0\\shad0\\1c&H000000&\\1a&H00&}` +
-      `m 0 0 l ${bw} 0 ${bw} ${bh} 0 ${bh}{\\p0}`;
-    events.push(
-      `Dialogue: 0,${start},${end},Cover,,0,0,0,,${coverDraw}`,
-    );
-
-    // 2) Translated text: white-ish text matching original color, centered
+    // Translated text: white-ish text matching original color, centered
     //    at the original bbox center. \an5 = middle-center align of \pos.
     //    Hebrew/RTL is rendered correctly by libass for RTL scripts.
     const wrapped = formatSubtitleLines(text);
