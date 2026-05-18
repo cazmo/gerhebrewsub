@@ -67,6 +67,8 @@ async function getAudioDuration(audioPath: string): Promise<number> {
   }
 }
 
+const MAX_VIDEO_DURATION_SEC = 110 * 60; // 110 minutes
+const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024; // 500 MB
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600;
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
@@ -311,6 +313,20 @@ async function extractAudio(inputPath: string, outputMp3: string): Promise<void>
   await execFileAsync("ffmpeg", ["-y", "-i", inputPath, "-vn", "-acodec", "libmp3lame", "-q:a", "4", outputMp3]);
 }
 
+async function getYouTubeDurationSec(url: string, cookiesPath?: string): Promise<number> {
+  const ytDlpBin = process.env.YT_DLP_PATH ?? "/home/runner/workspace/bin/yt-dlp";
+  try {
+    const args = ["--no-playlist", "--print", "duration", "--skip-download"];
+    if (cookiesPath) args.push("--cookies", cookiesPath);
+    args.push(url);
+    const { stdout } = await execFileAsync(ytDlpBin, args, { timeout: 30_000 });
+    const sec = parseFloat(stdout.trim());
+    return isNaN(sec) ? 0 : sec;
+  } catch {
+    return 0;
+  }
+}
+
 async function downloadYouTube(url: string, outputPath: string, cookiesPath?: string): Promise<void> {
   const ytDlpBin = process.env.YT_DLP_PATH ?? "/home/runner/workspace/bin/yt-dlp";
 
@@ -424,17 +440,41 @@ export async function runPipeline(jobId: string): Promise<void> {
             // proceed without
           }
         }
+
+        // Check YouTube duration before downloading
+        const ytDuration = await getYouTubeDurationSec(job.inputUrl!, cookiesPath);
+        if (ytDuration > 0 && ytDuration > MAX_VIDEO_DURATION_SEC) {
+          const mins = Math.round(ytDuration / 60);
+          throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 110 דקות.`);
+        }
+
         await downloadYouTube(job.inputUrl!, videoPath, cookiesPath);
       } else {
         if (job.localPath) {
+          // Check file size before copying
+          const { statSync } = await import("fs");
+          const stat = statSync(job.localPath);
+          if (stat.size > MAX_VIDEO_SIZE_BYTES) {
+            throw new Error(`גודל הקובץ (${(stat.size / 1024 / 1024).toFixed(0)} MB) עולה על המקסימום המותר של 500MB.`);
+          }
           await fs.copyFile(job.localPath, videoPath);
           fs.unlink(job.localPath).catch(() => {});
         } else if (job.inputKey) {
           const buf = await gcsDownload(job.inputKey);
+          if (buf.length > MAX_VIDEO_SIZE_BYTES) {
+            throw new Error(`גודל הקובץ עולה על המקסימום המותר של 500MB.`);
+          }
           await fs.writeFile(videoPath, buf);
         } else {
           throw new Error("No video source available");
         }
+      }
+
+      // Validate video duration after it's available locally
+      const videoDuration = await getAudioDuration(videoPath);
+      if (videoDuration > 0 && videoDuration > MAX_VIDEO_DURATION_SEC) {
+        const mins = Math.round(videoDuration / 60);
+        throw new Error(`משך הסרטון (${mins} דקות) עולה על המקסימום המותר של 110 דקות.`);
       }
 
       await advance("transcribing");
