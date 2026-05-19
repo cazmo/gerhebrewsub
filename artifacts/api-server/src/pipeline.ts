@@ -976,20 +976,26 @@ function computeBurnedSegmentLayout(
     const st: OcrFrameStyle = seg.style ?? {
       yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
     };
-    const detectedFs = Math.round(st.height * videoH * 0.95);
-    const fontSize = Math.max(20, Math.min(110, detectedFs || Math.round(videoH * 0.055)));
+    // Font size matched to the OCR-detected glyph height. 1.05× compensates
+    // for the OCR usually under-reporting (it measures cap height, not full
+    // line height with descenders). Wider clamp so big on-screen titles
+    // aren't shrunk.
+    const detectedFs = Math.round(st.height * videoH * 1.05);
+    const fontSize = Math.max(16, Math.min(140, detectedFs || Math.round(videoH * 0.055)));
     const cx = Math.max(0, Math.min(videoW, Math.round(st.xCenter * videoW)));
     const cy = Math.max(0, Math.min(videoH, Math.round(st.yCenter * videoH)));
     const textH = Math.max(8, Math.round(st.height * videoH));
     const textW = Math.max(20, Math.round(st.width * videoW));
-    // Delogo strip — very generous full-width band to fully erase original
-    // glyphs. We use 3.0× the OCR-detected text height (with a healthy floor)
-    // because real subtitles often have descenders, outlines and shadows that
-    // extend well outside the tight glyph bbox the OCR reports.
-    const bandHeight = Math.max(Math.round(st.height * videoH * 3.0), Math.round(videoH * 0.18));
-    const bw = videoW - 4;
-    const bh = Math.min(videoH - 4, bandHeight);
-    const bx = 2;
+    // Mask box — tight rectangle that fully covers the original text plus a
+    // generous margin for outline/shadow. Drawn as a solid black box (see
+    // embedSubtitles), guaranteeing zero residue. Width gets +30% margin
+    // (outline + side glow), height gets +60% (descenders, top accents,
+    // drop shadow).
+    const maskW = Math.min(videoW - 4, Math.max(40, Math.round(textW * 1.3)));
+    const maskH = Math.min(videoH - 4, Math.max(20, Math.round(textH * 1.6)));
+    const bw = maskW;
+    const bh = maskH;
+    const bx = Math.max(2, Math.min(videoW - bw - 2, cx - Math.round(bw / 2)));
     const by = Math.max(2, Math.min(videoH - bh - 2, cy - Math.round(bh / 2)));
     out.push({
       start: seg.start, end: seg.end, text,
@@ -1087,82 +1093,31 @@ async function embedSubtitles(
   const escapedPath = escapeFfmpegSubPath(subPath);
 
   const vfParts: string[] = [];
-  // When delogoRegions exist we need a proper filter-graph (split + overlay)
-  // to do per-region targeted boxblur, so build it separately and skip the
-  // simple comma-chain path.
-  let useGraph = !!(delogoRegions && delogoRegions.length > 0);
-  let graph = "";
 
-  if (useGraph && delogoRegions) {
-    // Step 1 — delogo passes (twice per region with feathered band) to inpaint
-    // the original text using surrounding pixels.
-    const delogoParts: string[] = [];
-    // ffmpeg 6.x removed the `band` parameter from delogo, so we use only the
-    // core x/y/w/h options. Two passes still help — each pass uses the
-    // previous pass's inpaint as samples, smoothing residue further.
-    for (const _pass of [0, 1]) {
-      for (const r of delogoRegions) {
-        const x = Math.max(1, r.bx);
-        const y = Math.max(1, r.by);
-        const w = Math.max(2, r.bw);
-        const h = Math.max(2, r.bh);
-        const s = r.start.toFixed(2);
-        const e = r.end.toFixed(2);
-        delogoParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${s},${e})'`);
-      }
-    }
-
-    // Step 2 — per-region targeted boxblur applied as a chain of
-    // split/crop/boxblur/overlay. This wipes any residual high-frequency
-    // glyph edges that delogo couldn't fully eliminate, without affecting
-    // the rest of the frame or any time outside the segment's window.
-    graph = `[0:v]${delogoParts.join(",")}[base0]`;
-    let prev = "base0";
-    for (let i = 0; i < delogoRegions.length; i++) {
-      const r = delogoRegions[i];
+  // Mask out original burned-in subtitles with a tight solid black rectangle
+  // per region, time-gated to the segment's display window. This guarantees
+  // ZERO residue from the original text (unlike delogo, which leaves edges
+  // of high-contrast glyphs visible). The translated subtitle is drawn at
+  // the same cx/cy with the same font size on top, so the black rectangle
+  // looks like a natural subtitle background.
+  if (delogoRegions && delogoRegions.length > 0) {
+    for (const r of delogoRegions) {
       const x = Math.max(0, r.bx);
       const y = Math.max(0, r.by);
-      const w = Math.max(2, Math.min(r.bw, 99999));
+      const w = Math.max(2, r.bw);
       const h = Math.max(2, r.bh);
       const s = r.start.toFixed(2);
       const e = r.end.toFixed(2);
-      const srcLabel = `src${i}`;
-      const mainLabel = `m${i}`;
-      const blurLabel = `bl${i}`;
-      const outLabel = `v${i}`;
-      // Crop the inpainted strip and blur it heavily; overlay only during
-      // the segment's display window so non-subtitle moments are untouched.
-      graph += `;[${prev}]split=2[${mainLabel}][${srcLabel}]`;
-      graph += `;[${srcLabel}]crop=${w}:${h}:${x}:${y},boxblur=lr=12:cr=8[${blurLabel}]`;
-      graph += `;[${mainLabel}][${blurLabel}]overlay=${x}:${y}:enable='between(t,${s},${e})'[${outLabel}]`;
-      prev = outLabel;
+      vfParts.push(
+        `drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=black@1.0:t=fill:enable='between(t,${s},${e})'`,
+      );
     }
-
-    // Step 3 — subtitle render(s) on the cleaned video.
-    const subFilters: string[] = [];
-    if (isAss) {
-      subFilters.push(`subtitles=${escapedPath}`);
-    } else {
-      // Should not normally happen with delogoRegions, but keep a safe path.
-      subFilters.push(`subtitles=${escapedPath}`);
-    }
-    if (extraBottomSrtPath) {
-      const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
-      const extraStyle = [
-        "FontName=DejaVu Sans","FontSize=26","Alignment=2","MarginV=20",
-        "MarginL=40","MarginR=40","PrimaryColour=&H00FFFFFF",
-        "OutlineColour=&H00000000","BackColour=&HCC000000",
-        "BorderStyle=3","Outline=4","Shadow=0","Bold=0","WrapStyle=2",
-      ].join(",");
-      subFilters.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
-    }
-    graph += `;[${prev}]${subFilters.join(",")}[vout]`;
   }
 
-  if (!useGraph && isAss) {
+  if (isAss) {
     // ASS already encodes per-line position, color and size.
     vfParts.push(`subtitles=${escapedPath}`);
-  } else if (!useGraph) {
+  } else {
     const alignment = position === "top" ? 8 : 2;
     const style = coverOriginalSubs
       ? [
@@ -1204,50 +1159,28 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${escapedPath}:force_style='${style}'`);
   }
 
-  // Optional extra bottom subtitle band — used in the non-burned flow so that
-  // viewers get a classic bottom subtitle strip. In the burned-in (useGraph)
-  // path this is already wired into the filter graph above.
-  if (!useGraph && extraBottomSrtPath) {
+  // Optional extra bottom subtitle band — used in the burned-in flow so the
+  // spoken-audio translation appears as a classic bottom strip in addition
+  // to the in-place burned replacement.
+  if (extraBottomSrtPath) {
     const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
     const extraStyle = [
-      "FontName=DejaVu Sans",
-      "FontSize=26",
-      "Alignment=2",
-      "MarginV=20",
-      "MarginL=40",
-      "MarginR=40",
-      "PrimaryColour=&H00FFFFFF",
-      "OutlineColour=&H00000000",
-      "BackColour=&HCC000000",
-      "BorderStyle=3",
-      "Outline=4",
-      "Shadow=0",
-      "Bold=0",
-      "WrapStyle=2",
+      "FontName=DejaVu Sans","FontSize=26","Alignment=2","MarginV=20",
+      "MarginL=40","MarginR=40","PrimaryColour=&H00FFFFFF",
+      "OutlineColour=&H00000000","BackColour=&HCC000000",
+      "BorderStyle=3","Outline=4","Shadow=0","Bold=0","WrapStyle=2",
     ].join(",");
     vfParts.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
   }
 
-  const ffmpegArgs = useGraph
-    ? [
-        "-y", "-i", videoPath,
-        "-filter_complex", graph,
-        "-map", "[vout]",
-        "-map", "0:a?",
-        "-c:a", "copy",
-        "-preset", "fast",
-        "-movflags", "+faststart",
-        outputPath,
-      ]
-    : [
-        "-y", "-i", videoPath,
-        "-vf", vfParts.join(","),
-        "-c:a", "copy",
-        "-preset", "fast",
-        "-movflags", "+faststart",
-        outputPath,
-      ];
-  await execFileAsync("ffmpeg", ffmpegArgs);
+  await execFileAsync("ffmpeg", [
+    "-y", "-i", videoPath,
+    "-vf", vfParts.join(","),
+    "-c:a", "copy",
+    "-preset", "fast",
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
 }
 
 // ─── TTS dubbing ─────────────────────────────────────────────────────────────
