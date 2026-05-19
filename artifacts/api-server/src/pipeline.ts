@@ -504,7 +504,7 @@ async function detectBurnedInSubsFast(
 }
 
 const OCR_INTERVAL_SEC = 2; // sample frame every 2s for tight sync with burned-in subs
-const OCR_PARALLEL = 8;
+const OCR_PARALLEL = 30;
 
 function findFirstJsonObject(s: string): string | null {
   // Walks the string and returns the first balanced {...} block.
