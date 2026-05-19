@@ -982,8 +982,11 @@ function computeBurnedSegmentLayout(
     const cy = Math.max(0, Math.min(videoH, Math.round(st.yCenter * videoH)));
     const textH = Math.max(8, Math.round(st.height * videoH));
     const textW = Math.max(20, Math.round(st.width * videoW));
-    // Delogo strip — generous full-width band to fully erase original glyphs.
-    const bandHeight = Math.max(Math.round(st.height * videoH * 2.0), Math.round(videoH * 0.12));
+    // Delogo strip — very generous full-width band to fully erase original
+    // glyphs. We use 3.0× the OCR-detected text height (with a healthy floor)
+    // because real subtitles often have descenders, outlines and shadows that
+    // extend well outside the tight glyph bbox the OCR reports.
+    const bandHeight = Math.max(Math.round(st.height * videoH * 3.0), Math.round(videoH * 0.18));
     const bw = videoW - 4;
     const bh = Math.min(videoH - 4, bandHeight);
     const bx = 2;
@@ -1088,15 +1091,23 @@ async function embedSubtitles(
   // Inpaint original burned-in text regions with delogo (samples surrounding
   // pixels). Each region is time-gated to its segment's display window.
   if (delogoRegions && delogoRegions.length > 0) {
-    for (const r of delogoRegions) {
-      // delogo requires x>0 and y>0 (positive ints); clamp to >=1
-      const x = Math.max(1, r.bx);
-      const y = Math.max(1, r.by);
-      const w = Math.max(2, r.bw);
-      const h = Math.max(2, r.bh);
-      const s = r.start.toFixed(2);
-      const e = r.end.toFixed(2);
-      vfParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${s},${e})'`);
+    // Apply delogo TWICE per region — the first pass replaces the bulk of the
+    // text with samples from surrounding pixels, the second pass smooths out
+    // residue (high-contrast glyph edges) left by the first pass. A larger
+    // `band` value feathers the edges of the replacement so the seam between
+    // patched and untouched pixels is much less visible.
+    for (const pass of [0, 1]) {
+      for (const r of delogoRegions) {
+        // delogo requires x>0 and y>0 (positive ints); clamp to >=1
+        const x = Math.max(1, r.bx);
+        const y = Math.max(1, r.by);
+        const w = Math.max(2, r.bw);
+        const h = Math.max(2, r.bh);
+        const s = r.start.toFixed(2);
+        const e = r.end.toFixed(2);
+        const band = pass === 0 ? 10 : 6;
+        vfParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:band=${band}:enable='between(t,${s},${e})'`);
+      }
     }
   }
 
