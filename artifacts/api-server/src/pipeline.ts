@@ -173,7 +173,11 @@ interface OcrFrameStyle {
   xCenter: number; // 0..1
   height: number;  // 0..1
   width: number;   // 0..1
-  color: string;   // #RRGGBB
+  color: string;   // #RRGGBB — text fill
+  bgColor?: string;     // #RRGGBB — background box color, if any
+  hasBox?: boolean;     // true if text sits on an opaque/translucent box
+  outlineColor?: string; // #RRGGBB — outline color (usually black)
+  bold?: boolean;
 }
 
 async function getAudioDuration(audioPath: string): Promise<number> {
@@ -545,15 +549,27 @@ function parseOcrJson(raw: string): { text: string; style?: OcrFrameStyle } {
       const n = typeof v === "number" ? v : parseFloat(String(v));
       return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : def;
     };
-    const color = typeof obj.color === "string" && /^#?[0-9a-f]{6}$/i.test(obj.color)
-      ? (obj.color.startsWith("#") ? obj.color : `#${obj.color}`).toUpperCase()
-      : "#FFFFFF";
+    const hex = (v: unknown, def: string | undefined): string | undefined => {
+      if (typeof v !== "string") return def;
+      const m = v.trim();
+      if (!/^#?[0-9a-f]{6}$/i.test(m)) return def;
+      return (m.startsWith("#") ? m : `#${m}`).toUpperCase();
+    };
+    const color = hex(obj.color, "#FFFFFF")!;
+    const bgColor = hex(obj.bgColor, undefined);
+    const outlineColor = hex(obj.outlineColor, undefined);
+    const hasBox = obj.hasBox === true || obj.hasBox === "true";
+    const bold = obj.bold === true || obj.bold === "true";
     const style: OcrFrameStyle = {
       yCenter: num(obj.yCenter, 0.9),
       xCenter: num(obj.xCenter, 0.5),
       height: num(obj.height, 0.06),
       width: num(obj.width, 0.6),
       color,
+      bgColor,
+      hasBox,
+      outlineColor,
+      bold,
     };
     return { text, style };
   } catch {
@@ -603,14 +619,19 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                         `Look at this video frame. If there are burned-in subtitles or on-screen text overlays, ` +
                         `translate them to ${targetLangName}. Return STRICT JSON ONLY (no markdown, no commentary) ` +
                         `with this EXACT shape — ALL FIELDS REQUIRED when text is present:\n` +
-                        `{"text":"<translation, max 80 chars, no quotes>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB"}\n` +
+                        `{"text":"<translation, max 80 chars, no quotes>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB","outlineColor":"#RRGGBB","hasBox":<true|false>,"bgColor":"#RRGGBB","bold":<true|false>}\n` +
                         `Coordinate rules (CRITICAL — measure carefully):\n` +
                         `- yCenter/xCenter = the CENTER of the original text's bounding box, normalized 0..1 ` +
                         `(x=0 left edge, x=1 right edge; y=0 top edge, y=1 bottom edge).\n` +
                         `- height = vertical size of the text (cap to baseline), normalized 0..1. For typical subtitles this is ~0.05–0.10.\n` +
                         `- width = horizontal extent of the text, normalized 0..1.\n` +
-                        `- color = dominant TEXT fill color in hex (usually #FFFFFF for white subs).\n` +
-                        `NEVER guess — measure from the actual pixels. Subtitles may be at the top, middle, or bottom — do NOT assume bottom.\n` +
+                        `Style rules:\n` +
+                        `- color = dominant TEXT fill color in hex (usually #FFFFFF for white subs, #FFFF00 for yellow).\n` +
+                        `- outlineColor = the color of the thin stroke/outline around each letter (usually #000000). If no visible outline, use "#000000".\n` +
+                        `- hasBox = true ONLY if the text clearly sits on top of a solid or translucent rectangular box/strip behind it (common in news tickers, lyric karaoke). false if the text is rendered directly over the video pixels with just an outline.\n` +
+                        `- bgColor = the color of that box (only meaningful when hasBox=true). If unsure use "#000000".\n` +
+                        `- bold = true if the text is clearly bold/heavy weight, otherwise false.\n` +
+                        `NEVER guess geometry — measure from the actual pixels. Subtitles may be at the top, middle, or bottom — do NOT assume bottom.\n` +
                         `If there is NO readable subtitle/overlay text (ignore small logos/watermarks like brand badges in corners), ` +
                         `return exactly {"text":"NONE"}.`,
                     },
@@ -658,14 +679,21 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
     const styles = perFrame.slice(i, j).map((p) => p.style).filter((s): s is OcrFrameStyle => !!s);
     let avgStyle: OcrFrameStyle | undefined;
     if (styles.length > 0) {
-      const avg = (k: keyof Omit<OcrFrameStyle, "color">): number =>
+      const numericKeys = ["yCenter", "xCenter", "height", "width"] as const;
+      const avg = (k: typeof numericKeys[number]): number =>
         styles.reduce((acc, s) => acc + s[k], 0) / styles.length;
+      const boxVotes = styles.filter((s) => s.hasBox).length;
+      const boldVotes = styles.filter((s) => s.bold).length;
       avgStyle = {
         yCenter: avg("yCenter"),
         xCenter: avg("xCenter"),
         height: avg("height"),
         width: avg("width"),
         color: styles[0].color,
+        outlineColor: styles.find((s) => s.outlineColor)?.outlineColor,
+        bgColor: styles.find((s) => s.bgColor)?.bgColor,
+        hasBox: boxVotes > styles.length / 2,
+        bold: boldVotes > styles.length / 2,
       };
     }
     segments.push({ id: segments.length, start, end, text, style: avgStyle });
@@ -924,10 +952,16 @@ interface BurnedSegmentLayout {
   start: number;
   end: number;
   text: string;
-  bx: number; by: number; bw: number; bh: number; // pixel bbox
+  bx: number; by: number; bw: number; bh: number; // pixel delogo bbox
   cx: number; cy: number;                          // center
   fontSize: number;
-  primary: string;                                 // ASS color
+  primary: string;                                 // ASS PrimaryColour (text fill)
+  outline: string;                                 // ASS OutlineColour
+  back: string;                                    // ASS BackColour (used when hasBox)
+  hasBox: boolean;
+  bold: boolean;
+  textW: number;                                   // pixel width of original text bbox
+  textH: number;                                   // pixel height of original text bbox
 }
 
 function computeBurnedSegmentLayout(
@@ -942,24 +976,28 @@ function computeBurnedSegmentLayout(
     const st: OcrFrameStyle = seg.style ?? {
       yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
     };
-    // Place translation at the EXACT original position (xCenter, yCenter).
-    // Match font size to the original subtitle height detected by OCR.
-    // height is normalized (0..1) and represents the full glyph block height;
-    // map it to ASS font size with a small reduction so wrapping doesn't push
-    // off-screen. Clamp to a sane range.
     const detectedFs = Math.round(st.height * videoH * 0.95);
     const fontSize = Math.max(20, Math.min(110, detectedFs || Math.round(videoH * 0.055)));
     const cx = Math.max(0, Math.min(videoW, Math.round(st.xCenter * videoW)));
     const cy = Math.max(0, Math.min(videoH, Math.round(st.yCenter * videoH)));
-    // Delogo strip: cover the original text. Use a full-width band so we don't
-    // miss edges from imprecise OCR coordinates. Height is generous (200% of
-    // detected text height, with a floor) to fully erase original glyphs.
+    const textH = Math.max(8, Math.round(st.height * videoH));
+    const textW = Math.max(20, Math.round(st.width * videoW));
+    // Delogo strip — generous full-width band to fully erase original glyphs.
     const bandHeight = Math.max(Math.round(st.height * videoH * 2.0), Math.round(videoH * 0.12));
     const bw = videoW - 4;
     const bh = Math.min(videoH - 4, bandHeight);
     const bx = 2;
     const by = Math.max(2, Math.min(videoH - bh - 2, cy - Math.round(bh / 2)));
-    out.push({ start: seg.start, end: seg.end, text, bx, by, bw, bh, cx, cy, fontSize, primary: hexToAssColor(st.color) });
+    out.push({
+      start: seg.start, end: seg.end, text,
+      bx, by, bw, bh, cx, cy, fontSize,
+      primary: hexToAssColor(st.color),
+      outline: hexToAssColor(st.outlineColor ?? "#000000"),
+      back: hexToAssColor(st.bgColor ?? "#000000"),
+      hasBox: st.hasBox === true,
+      bold: st.bold === true,
+      textW, textH,
+    });
   }
   return out;
 }
@@ -997,8 +1035,15 @@ function buildAssFromBurnedSegments(
     const end = secondsToAssTime(seg.end);
     const wrapped = formatSubtitleLines(seg.text);
     const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
+    const bold = seg.bold ? 1 : 0;
+    // BorderStyle 4 = opaque box behind text (uses BackColour); 1 = outline+shadow.
+    const border = seg.hasBox ? 4 : 1;
+    const outlineW = seg.hasBox ? 0 : 2;
+    const shadowW = seg.hasBox ? 0 : 1;
     const textOverride =
-      `{\\an5\\pos(${seg.cx},${seg.cy})\\fs${seg.fontSize}\\c${seg.primary}\\3c&H000000&\\bord2\\shad1\\b1}`;
+      `{\\an5\\pos(${seg.cx},${seg.cy})\\fs${seg.fontSize}` +
+      `\\c${seg.primary}\\3c${seg.outline}\\4c${seg.back}` +
+      `\\bord${outlineW}\\shad${shadowW}\\b${bold}\\bs${border}}`;
     events.push(
       `Dialogue: 1,${start},${end},Default,,0,0,0,,${textOverride}${safe}`,
     );
@@ -1405,9 +1450,14 @@ export async function runPipeline(jobId: string): Promise<void> {
         hasBurnedInSubs = false;
       }
 
+      // Preserve the original spoken-audio segments — they are used to build
+      // the bottom subtitle strip (translation of the SPEAKER), independently
+      // of the burned-in on-screen text that goes in the in-place overlay.
+      const spokenSegments: WhisperSegment[] = whisperSegments.slice();
+
       // When burned-in subs detected → OCR-translate them and use those
-      // segments as the subtitle source. The OCR timing tracks the actual
-      // on-screen subtitle display, so correlation is correct.
+      // segments as the in-place subtitle source. The OCR timing tracks the
+      // actual on-screen subtitle display, so correlation is correct.
       if (hasBurnedInSubs) {
         const ocrResult = await extractTextViaOcr(videoPath, tmpDir, targetLang);
         if (ocrResult.segments.length > 0) {
@@ -1428,12 +1478,19 @@ export async function runPipeline(jobId: string): Promise<void> {
       // ── Translating ─────────────────────────────────────────────────────────
       await advance("translating");
       let translations: string[];
+      // Translated spoken-audio segments — used for the bottom strip in the
+      // burned-in branch and for TTS dubbing.
+      let spokenTranslations: string[] = [];
 
-      // If OCR already returned translated text, use it directly
+      // If OCR already returned translated text, use it for the in-place layer.
       if (burnedInTranslatedAlready) {
         translations = whisperSegments.map((s) => s.text);
+        if (spokenSegments.length > 0) {
+          spokenTranslations = await translateSegments(spokenSegments, sourceLang, targetLang);
+        }
       } else {
         translations = await translateSegments(whisperSegments, sourceLang, targetLang);
+        spokenTranslations = translations;
       }
 
       const segmentRows: InsertJobSegment[] = whisperSegments.map((s, i) => ({
@@ -1458,12 +1515,25 @@ export async function runPipeline(jobId: string): Promise<void> {
       const srtPath = path.join(tmpDir, "subtitles.srt");
       await fs.writeFile(srtPath, srtContent, "utf8");
 
+      // Build a separate SRT for SPOKEN-AUDIO translations (the speaker). In
+      // the burned-in branch this drives the classic bottom strip and the TTS
+      // dub, independently from the on-screen OCR text.
+      const spokenSubs = spokenSegments.map((s, i) => ({
+        startTime: s.start,
+        endTime: s.end,
+        translatedText: spokenTranslations[i] ?? null,
+      }));
+      const spokenSrtPath = path.join(tmpDir, "subtitles.spoken.srt");
+      if (spokenSubs.length > 0) {
+        await fs.writeFile(spokenSrtPath, buildSrt(spokenSubs), "utf8");
+      }
+
       const subtitlePosition = (job.subtitlePosition === "top" ? "top" : "bottom") as "top" | "bottom";
       const outputVideoPath = path.join(tmpDir, "output.mp4");
 
-      // For burned-in source: build ASS that places each translation at the
-      // original subtitle's exact bbox with matching color/size and an opaque
-      // cover sized to that bbox.
+      // For burned-in source: build ASS that places each OCR translation at
+      // the original subtitle's exact bbox with matching color/size/box, AND
+      // overlay a classic bottom strip carrying the SPEAKER's translation.
       if (burnedInTranslatedAlready) {
         const { w: vidW, h: vidH } = await getVideoDimensions(videoPath);
         const layout = computeBurnedSegmentLayout(
@@ -1479,8 +1549,10 @@ export async function runPipeline(jobId: string): Promise<void> {
         const assContent = buildAssFromBurnedSegments(layout, vidW, vidH);
         const assPath = path.join(tmpDir, "subtitles.ass");
         await fs.writeFile(assPath, assContent, "utf8");
-        // Burn ASS (in-place replacement) AND classic bottom strip from SRT.
-        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout, srtPath);
+        // Burn ASS (in-place replacement) AND bottom strip from spoken SRT
+        // (falls back to OCR SRT if no spoken segments).
+        const bottomSrt = spokenSubs.length > 0 ? spokenSrtPath : srtPath;
+        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout, bottomSrt);
       } else {
         await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
       }
@@ -1489,12 +1561,20 @@ export async function runPipeline(jobId: string): Promise<void> {
       const voiceId = normalizeVoiceId(job.voiceId ?? null);
       if (voiceId) {
         try {
+          // Dub from spoken-audio translations (the speaker), not OCR text.
+          const dubSourceSegments = spokenSubs.length > 0
+            ? spokenSubs.map((s) => ({
+                startTime: s.startTime,
+                endTime: s.endTime,
+                translatedText: s.translatedText,
+              }))
+            : segmentRows.map((s) => ({
+                startTime: s.startTime,
+                endTime: s.endTime,
+                translatedText: s.translatedText ?? null,
+              }));
           const dubPath = await generateDubbedAudio(
-            segmentRows.map((s) => ({
-              startTime: s.startTime,
-              endTime: s.endTime,
-              translatedText: s.translatedText ?? null,
-            })),
+            dubSourceSegments,
             videoDuration,
             voiceId,
             tmpDir,
