@@ -1121,7 +1121,7 @@ async function embedSubtitles(
       // luma_radius/chroma_radius=20, 4 passes => obliterates text completely
       // and produces a smooth color matching the surroundings.
       graph += `[${prev}]split=2[${mainLabel}][${srcLabel}];`;
-      graph += `[${srcLabel}]crop=${w}:${h}:${x}:${y},boxblur=lr=20:cr=20:luma_power=4:chroma_power=4[${blurLabel}];`;
+      graph += `[${srcLabel}]crop=${w}:${h}:${x}:${y},boxblur=lr=15:cr=15:luma_power=4:chroma_power=4[${blurLabel}];`;
       graph += `[${mainLabel}][${blurLabel}]overlay=${x}:${y}:enable='between(t,${s},${e})'[${outLabel}];`;
       prev = outLabel;
     }
