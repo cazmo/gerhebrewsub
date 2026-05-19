@@ -1386,35 +1386,23 @@ async function muxDubbedAudio(
   outputPath: string,
   hasOriginalAudio: boolean,
 ): Promise<void> {
-  if (hasOriginalAudio) {
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-i", videoPath,
-      "-i", dubPath,
-      "-filter_complex",
-      `[0:a]volume=0.15[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`,
-      "-map", "0:v:0",
-      "-map", "[aout]",
-      "-c:v", "copy",
-      "-c:a", "aac", "-b:a", "192k",
-      "-shortest",
-      "-movflags", "+faststart",
-      outputPath,
-    ]);
-  } else {
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-i", videoPath,
-      "-i", dubPath,
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      "-c:v", "copy",
-      "-c:a", "aac", "-b:a", "192k",
-      "-shortest",
-      "-movflags", "+faststart",
-      outputPath,
-    ]);
-  }
+  // Dub fully REPLACES the original audio — original track is dropped so the
+  // viewer hears only the selected Hebrew TTS voice. `hasOriginalAudio` is
+  // kept in the signature for backward compatibility but no longer affects
+  // the mux (it's intentionally unused).
+  void hasOriginalAudio;
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-i", videoPath,
+    "-i", dubPath,
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "192k",
+    "-shortest",
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
 }
 
 // ─── Main pipeline ────────────────────────────────────────────────────────────
