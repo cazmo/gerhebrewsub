@@ -589,12 +589,17 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                       text:
                         `Look at this video frame. If there are burned-in subtitles or on-screen text overlays, ` +
                         `translate them to ${targetLangName}. Return STRICT JSON ONLY (no markdown, no commentary) ` +
-                        `with this exact shape:\n` +
+                        `with this EXACT shape — ALL FIELDS REQUIRED when text is present:\n` +
                         `{"text":"<translation, max 80 chars, no quotes>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB"}\n` +
-                        `Where yCenter/xCenter is the CENTER of the original subtitle text bounding box (normalized 0..1 ` +
-                        `to image dimensions, y=0 is top, y=1 is bottom), height/width are the bbox size normalized, ` +
-                        `and color is the dominant TEXT color of the subtitle in hex.\n` +
-                        `If there is NO subtitle text visible (ignore logos/watermarks), return exactly {"text":"NONE"}.`,
+                        `Coordinate rules (CRITICAL — measure carefully):\n` +
+                        `- yCenter/xCenter = the CENTER of the original text's bounding box, normalized 0..1 ` +
+                        `(x=0 left edge, x=1 right edge; y=0 top edge, y=1 bottom edge).\n` +
+                        `- height = vertical size of the text (cap to baseline), normalized 0..1. For typical subtitles this is ~0.05–0.10.\n` +
+                        `- width = horizontal extent of the text, normalized 0..1.\n` +
+                        `- color = dominant TEXT fill color in hex (usually #FFFFFF for white subs).\n` +
+                        `NEVER guess — measure from the actual pixels. Subtitles may be at the top, middle, or bottom — do NOT assume bottom.\n` +
+                        `If there is NO readable subtitle/overlay text (ignore small logos/watermarks like brand badges in corners), ` +
+                        `return exactly {"text":"NONE"}.`,
                     },
                   ],
                 },
@@ -613,6 +618,16 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
         })();
       })
     );
+  }
+
+  // Bridge transient OCR misses: if a single empty frame sits between two text
+  // frames, copy the previous text into it so coverage is continuous through
+  // the whole video instead of breaking into many short segments with gaps.
+  for (let k = 1; k < perFrame.length - 1; k++) {
+    if (!perFrame[k].text && perFrame[k - 1].text && perFrame[k + 1].text) {
+      perFrame[k].text = perFrame[k - 1].text;
+      perFrame[k].style = perFrame[k - 1].style;
+    }
   }
 
   // Collapse adjacent frames with the same translated text into a single segment.
@@ -914,20 +929,23 @@ function computeBurnedSegmentLayout(
     const st: OcrFrameStyle = seg.style ?? {
       yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
     };
-    // Model bbox is often tight on the glyphs; widen significantly so delogo
-    // reliably removes the original text even with imprecise OCR coordinates.
-    // Strategy: full-width horizontal band centered at the detected yCenter,
-    // with height = max(OCR height + padding, 14% of video height).
-    const bandHeight = Math.max(Math.round(st.height * videoH * 2.2), Math.round(videoH * 0.14));
-    const bw = videoW - 4; // full width minus 2px margin
-    const bh = bandHeight;
-    const cx = Math.round(videoW / 2); // re-center horizontally to mid-screen
-    const cy = Math.round(st.yCenter * videoH);
+    // Place translation at the EXACT original position (xCenter, yCenter).
+    // Match font size to the original subtitle height detected by OCR.
+    // height is normalized (0..1) and represents the full glyph block height;
+    // map it to ASS font size with a small reduction so wrapping doesn't push
+    // off-screen. Clamp to a sane range.
+    const detectedFs = Math.round(st.height * videoH * 0.95);
+    const fontSize = Math.max(20, Math.min(110, detectedFs || Math.round(videoH * 0.055)));
+    const cx = Math.max(0, Math.min(videoW, Math.round(st.xCenter * videoW)));
+    const cy = Math.max(0, Math.min(videoH, Math.round(st.yCenter * videoH)));
+    // Delogo strip: cover the original text. Use a full-width band so we don't
+    // miss edges from imprecise OCR coordinates. Height is generous (200% of
+    // detected text height, with a floor) to fully erase original glyphs.
+    const bandHeight = Math.max(Math.round(st.height * videoH * 2.0), Math.round(videoH * 0.12));
+    const bw = videoW - 4;
+    const bh = Math.min(videoH - 4, bandHeight);
     const bx = 2;
     const by = Math.max(2, Math.min(videoH - bh - 2, cy - Math.round(bh / 2)));
-    // Font size: scale relative to video height so subtitles are clearly
-    // readable (≈ 5–6% of video height per line).
-    const fontSize = Math.max(28, Math.min(72, Math.round(videoH * 0.055)));
     out.push({ start: seg.start, end: seg.end, text, bx, by, bw, bh, cx, cy, fontSize, primary: hexToAssColor(st.color) });
   }
   return out;
