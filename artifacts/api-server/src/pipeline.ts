@@ -1093,31 +1093,57 @@ async function embedSubtitles(
   const escapedPath = escapeFfmpegSubPath(subPath);
 
   const vfParts: string[] = [];
+  const useGraph = !!(delogoRegions && delogoRegions.length > 0);
+  let graph = "";
 
-  // Mask out original burned-in subtitles with a tight solid black rectangle
-  // per region, time-gated to the segment's display window. This guarantees
-  // ZERO residue from the original text (unlike delogo, which leaves edges
-  // of high-contrast glyphs visible). The translated subtitle is drawn at
-  // the same cx/cy with the same font size on top, so the black rectangle
-  // looks like a natural subtitle background.
-  if (delogoRegions && delogoRegions.length > 0) {
-    for (const r of delogoRegions) {
+  if (useGraph && delogoRegions) {
+    // Erase original burned-in subtitles by HEAVILY BLURRING the tight text
+    // region — this destroys the glyph edges while blending naturally into
+    // the surrounding video colors (no visible black box). The translated
+    // subtitle is drawn afterwards at the same cx/cy with the same font
+    // size, color, outline, and box style as the OCR-detected original.
+    //
+    // Chain per-region split → crop → boxblur → overlay. Each pass operates
+    // only inside the segment's display window.
+    let prev = "0:v";
+    for (let i = 0; i < delogoRegions.length; i++) {
+      const r = delogoRegions[i];
       const x = Math.max(0, r.bx);
       const y = Math.max(0, r.by);
-      const w = Math.max(2, r.bw);
+      const w = Math.max(2, Math.min(r.bw, 99999));
       const h = Math.max(2, r.bh);
       const s = r.start.toFixed(2);
       const e = r.end.toFixed(2);
-      vfParts.push(
-        `drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=black@1.0:t=fill:enable='between(t,${s},${e})'`,
-      );
+      const mainLabel = `m${i}`;
+      const srcLabel = `s${i}`;
+      const blurLabel = `b${i}`;
+      const outLabel = `v${i}`;
+      // luma_radius/chroma_radius=20, 4 passes => obliterates text completely
+      // and produces a smooth color matching the surroundings.
+      graph += `[${prev}]split=2[${mainLabel}][${srcLabel}];`;
+      graph += `[${srcLabel}]crop=${w}:${h}:${x}:${y},boxblur=lr=20:cr=20:luma_power=4:chroma_power=4[${blurLabel}];`;
+      graph += `[${mainLabel}][${blurLabel}]overlay=${x}:${y}:enable='between(t,${s},${e})'[${outLabel}];`;
+      prev = outLabel;
     }
+    // Translated subtitle render on the cleaned video.
+    const subChain: string[] = [`subtitles=${escapedPath}`];
+    if (extraBottomSrtPath) {
+      const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
+      const extraStyle = [
+        "FontName=DejaVu Sans","FontSize=26","Alignment=2","MarginV=20",
+        "MarginL=40","MarginR=40","PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000","BackColour=&HCC000000",
+        "BorderStyle=3","Outline=4","Shadow=0","Bold=0","WrapStyle=2",
+      ].join(",");
+      subChain.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
+    }
+    graph += `[${prev}]${subChain.join(",")}[vout]`;
   }
 
-  if (isAss) {
+  if (!useGraph && isAss) {
     // ASS already encodes per-line position, color and size.
     vfParts.push(`subtitles=${escapedPath}`);
-  } else {
+  } else if (!useGraph) {
     const alignment = position === "top" ? 8 : 2;
     const style = coverOriginalSubs
       ? [
@@ -1159,10 +1185,9 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${escapedPath}:force_style='${style}'`);
   }
 
-  // Optional extra bottom subtitle band — used in the burned-in flow so the
-  // spoken-audio translation appears as a classic bottom strip in addition
-  // to the in-place burned replacement.
-  if (extraBottomSrtPath) {
+  // Optional extra bottom subtitle band — non-burned flow. In the burned-in
+  // (useGraph) flow this is already wired into the filter_complex above.
+  if (!useGraph && extraBottomSrtPath) {
     const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
     const extraStyle = [
       "FontName=DejaVu Sans","FontSize=26","Alignment=2","MarginV=20",
@@ -1173,14 +1198,25 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
   }
 
-  await execFileAsync("ffmpeg", [
-    "-y", "-i", videoPath,
-    "-vf", vfParts.join(","),
-    "-c:a", "copy",
-    "-preset", "fast",
-    "-movflags", "+faststart",
-    outputPath,
-  ]);
+  const ffmpegArgs = useGraph
+    ? [
+        "-y", "-i", videoPath,
+        "-filter_complex", graph,
+        "-map", "[vout]", "-map", "0:a?",
+        "-c:a", "copy",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        outputPath,
+      ]
+    : [
+        "-y", "-i", videoPath,
+        "-vf", vfParts.join(","),
+        "-c:a", "copy",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        outputPath,
+      ];
+  await execFileAsync("ffmpeg", ffmpegArgs);
 }
 
 // ─── TTS dubbing ─────────────────────────────────────────────────────────────
