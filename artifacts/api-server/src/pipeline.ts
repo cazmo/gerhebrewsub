@@ -1015,6 +1015,16 @@ function buildAssFromBurnedSegments(
  * When subPath is .ass (burned-in flow) it already contains per-segment
  * position, style and cover boxes — no drawbox needed.
  */
+function escapeFfmpegSubPath(p: string): string {
+  return p
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
+}
+
 async function embedSubtitles(
   videoPath: string,
   subPath: string,
@@ -1022,16 +1032,11 @@ async function embedSubtitles(
   coverOriginalSubs: boolean,
   position: "bottom" | "top" = "bottom",
   delogoRegions?: BurnedSegmentLayout[],
+  extraBottomSrtPath?: string,
 ): Promise<void> {
   const isAss = subPath.toLowerCase().endsWith(".ass");
 
-  const escapedPath = subPath
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/,/g, "\\,")
-    .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]");
+  const escapedPath = escapeFfmpegSubPath(subPath);
 
   const vfParts: string[] = [];
 
@@ -1093,6 +1098,30 @@ async function embedSubtitles(
       vfParts.push("drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black:t=fill");
     }
     vfParts.push(`subtitles=${escapedPath}:force_style='${style}'`);
+  }
+
+  // Optional extra bottom subtitle band — used in the burned-in flow so that
+  // viewers get BOTH the in-place replacement AND a classic bottom subtitle
+  // strip like in the non-burned mode.
+  if (extraBottomSrtPath) {
+    const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
+    const extraStyle = [
+      "FontName=DejaVu Sans",
+      "FontSize=26",
+      "Alignment=2",
+      "MarginV=20",
+      "MarginL=40",
+      "MarginR=40",
+      "PrimaryColour=&H00FFFFFF",
+      "OutlineColour=&H00000000",
+      "BackColour=&HCC000000",
+      "BorderStyle=3",
+      "Outline=4",
+      "Shadow=0",
+      "Bold=0",
+      "WrapStyle=2",
+    ].join(",");
+    vfParts.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
   }
 
   await execFileAsync("ffmpeg", [
@@ -1450,7 +1479,8 @@ export async function runPipeline(jobId: string): Promise<void> {
         const assContent = buildAssFromBurnedSegments(layout, vidW, vidH);
         const assPath = path.join(tmpDir, "subtitles.ass");
         await fs.writeFile(assPath, assContent, "utf8");
-        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout);
+        // Burn ASS (in-place replacement) AND classic bottom strip from SRT.
+        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout, srtPath);
       } else {
         await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
       }
