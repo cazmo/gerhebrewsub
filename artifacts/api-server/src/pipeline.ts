@@ -1097,7 +1097,10 @@ async function embedSubtitles(
     // Step 1 — delogo passes (twice per region with feathered band) to inpaint
     // the original text using surrounding pixels.
     const delogoParts: string[] = [];
-    for (const pass of [0, 1]) {
+    // ffmpeg 6.x removed the `band` parameter from delogo, so we use only the
+    // core x/y/w/h options. Two passes still help — each pass uses the
+    // previous pass's inpaint as samples, smoothing residue further.
+    for (const _pass of [0, 1]) {
       for (const r of delogoRegions) {
         const x = Math.max(1, r.bx);
         const y = Math.max(1, r.by);
@@ -1105,8 +1108,7 @@ async function embedSubtitles(
         const h = Math.max(2, r.bh);
         const s = r.start.toFixed(2);
         const e = r.end.toFixed(2);
-        const band = pass === 0 ? 10 : 6;
-        delogoParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:band=${band}:enable='between(t,${s},${e})'`);
+        delogoParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${s},${e})'`);
       }
     }
 
