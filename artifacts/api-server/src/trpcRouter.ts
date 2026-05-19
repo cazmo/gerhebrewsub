@@ -51,6 +51,7 @@ export const appRouter = t.router({
           sourceLang: langCodeSchema,
           targetLang: langCodeSchema,
           subtitlePosition: z.enum(["bottom", "top"]).optional(),
+          voiceId: z.string().max(20).nullable().optional(),
         })
       )
       .mutation(async ({ input }) => {
@@ -62,6 +63,7 @@ export const appRouter = t.router({
           input.sourceLang ?? "auto",
           input.targetLang ?? "he",
           input.subtitlePosition ?? "bottom",
+          input.voiceId ?? null,
         );
         return { jobId };
       }),
@@ -74,6 +76,7 @@ export const appRouter = t.router({
           sourceLang: langCodeSchema,
           targetLang: langCodeSchema,
           subtitlePosition: z.enum(["bottom", "top"]).optional(),
+          voiceId: z.string().max(20).nullable().optional(),
         })
       )
       .mutation(async ({ input }) => {
@@ -93,6 +96,7 @@ export const appRouter = t.router({
           input.sourceLang ?? "auto",
           input.targetLang ?? "he",
           input.subtitlePosition ?? "bottom",
+          input.voiceId ?? null,
         );
         return { jobId };
       }),

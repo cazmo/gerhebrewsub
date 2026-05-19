@@ -24,6 +24,7 @@ export const jobs = pgTable("jobs", {
   hasBurnedInSubs: boolean("has_burned_in_subs").default(false),
   srtKey: text("srt_key"),
   subtitlePosition: varchar("subtitle_position", { length: 10 }).default("bottom").notNull(),
+  voiceId: varchar("voice_id", { length: 20 }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

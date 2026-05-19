@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { useLocation } from "wouter";
 import { toast } from "sonner";
 import { trpc } from "../lib/trpc";
-import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight, Clipboard, AlignVerticalJustifyStart, AlignVerticalJustifyEnd } from "lucide-react";
+import { Upload, Link, Film, Loader2, Youtube, ChevronRight, X, ChevronDown, ChevronUp, Globe, ArrowLeftRight, Clipboard, AlignVerticalJustifyStart, AlignVerticalJustifyEnd, Mic, MicOff, User, UserRound, VolumeX } from "lucide-react";
 
 type Tab = "file" | "youtube";
 
@@ -37,6 +37,16 @@ const SOURCE_LANGS: [string, string][] = [
 
 // Target languages (no auto)
 const TARGET_LANGS: [string, string][] = SOURCE_LANGS.filter(([code]) => code !== "auto");
+
+type VoiceOption = { id: string; name: string; gender: "male" | "female" };
+const VOICES: VoiceOption[] = [
+  { id: "onyx",    name: "אורי",  gender: "male"   },
+  { id: "echo",    name: "איתן",  gender: "male"   },
+  { id: "ash",     name: "אריאל", gender: "male"   },
+  { id: "nova",    name: "נועה",  gender: "female" },
+  { id: "shimmer", name: "שירה",  gender: "female" },
+  { id: "coral",   name: "כרמל",  gender: "female" },
+];
 
 async function uploadInChunks(
   file: File,
@@ -122,6 +132,8 @@ export default function Home() {
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("he");
   const [subtitlePosition, setSubtitlePosition] = useState<"bottom" | "top">("bottom");
+  const [genderFilter, setGenderFilter] = useState<"none" | "male" | "female">("none");
+  const [voiceId, setVoiceId] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const startFromFile = trpc.jobs.startFromFile.useMutation();
@@ -163,6 +175,7 @@ export default function Home() {
         sourceLang,
         targetLang,
         subtitlePosition,
+        voiceId,
       });
       setLocation(`/job/${jobId}`);
     } catch (err) {
@@ -187,6 +200,7 @@ export default function Home() {
         sourceLang,
         targetLang,
         subtitlePosition,
+        voiceId,
       });
       setLocation(`/job/${jobId}`);
     } catch (err) {
@@ -259,6 +273,75 @@ export default function Home() {
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Voice dubbing */}
+          <div className="flex flex-col gap-2 pt-1">
+            <label className="text-xs text-muted-foreground font-medium flex items-center gap-1.5">
+              <Mic size={12} /> דיבוב קולי לשפת היעד
+            </label>
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                { v: "none",   label: "ללא דיבוב", icon: <VolumeX size={14} /> },
+                { v: "male",   label: "גבר",       icon: <User size={14} />    },
+                { v: "female", label: "אישה",      icon: <UserRound size={14} /> },
+              ] as const).map((opt) => (
+                <button
+                  key={opt.v}
+                  type="button"
+                  onClick={() => {
+                    setGenderFilter(opt.v);
+                    if (opt.v === "none") setVoiceId(null);
+                    else {
+                      const first = VOICES.find((vv) => vv.gender === opt.v);
+                      setVoiceId(first?.id ?? null);
+                    }
+                  }}
+                  className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl border text-xs font-medium transition-all ${
+                    genderFilter === opt.v
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border bg-transparent text-muted-foreground hover:text-foreground hover:border-border/80"
+                  }`}
+                >
+                  {opt.icon}
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
+            {genderFilter !== "none" && (
+              <div className="grid grid-cols-3 gap-2 mt-1">
+                {VOICES.filter((vv) => vv.gender === genderFilter).map((vv) => {
+                  const selected = voiceId === vv.id;
+                  const Icon = vv.gender === "male" ? User : UserRound;
+                  return (
+                    <button
+                      key={vv.id}
+                      type="button"
+                      onClick={() => setVoiceId(vv.id)}
+                      className={`flex flex-col items-center gap-1 py-2.5 px-2 rounded-xl border text-xs font-medium transition-all ${
+                        selected
+                          ? "border-primary/60 bg-primary/10 text-primary"
+                          : "border-border bg-transparent text-muted-foreground hover:text-foreground hover:border-border/80"
+                      }`}
+                    >
+                      <Icon size={18} className={selected ? "text-primary" : ""} />
+                      <span>{vv.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {genderFilter === "none" ? (
+              <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                <MicOff size={10} /> הסרטון יישאר עם הפסקול המקורי
+              </p>
+            ) : voiceId ? (
+              <p className="text-[10px] text-muted-foreground">
+                הדיבוב יוחל באודיו של הסרטון בעוצמה גבוהה, כשהפסקול המקורי מועם ברקע.
+              </p>
+            ) : null}
           </div>
         </div>
 

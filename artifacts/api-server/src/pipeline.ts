@@ -66,6 +66,19 @@ function langName(code: string): string {
   return LANG_NAMES_EN[code] ?? code;
 }
 
+// ─── Voice presets for dubbing ───────────────────────────────────────────────
+
+export const VOICES: Array<{ id: string; name: string; gender: "male" | "female" }> = [
+  { id: "onyx",    name: "אורי",  gender: "male"   },
+  { id: "echo",    name: "איתן",  gender: "male"   },
+  { id: "ash",     name: "אריאל", gender: "male"   },
+  { id: "nova",    name: "נועה",  gender: "female" },
+  { id: "shimmer", name: "שירה",  gender: "female" },
+  { id: "coral",   name: "כרמל",  gender: "female" },
+];
+
+const VOICE_IDS = new Set(VOICES.map((v) => v.id));
+
 // ─── Subtitle formatting ─────────────────────────────────────────────────────
 
 const MAX_LINE_CHARS = 42;
@@ -1092,6 +1105,175 @@ async function embedSubtitles(
   ]);
 }
 
+// ─── TTS dubbing ─────────────────────────────────────────────────────────────
+
+const TTS_CONCURRENCY = 6;
+
+/**
+ * Synthesizes each translated segment to MP3 via OpenAI TTS, then mixes the
+ * clips onto a silent track of the original duration (each clip starts at its
+ * segment startTime). If a clip is longer than its segment slot, it is sped up
+ * with `atempo` so subsequent segments aren't shifted out of sync.
+ *
+ * Returns the path to a single dubbed audio track (m4a) of `videoDuration`
+ * seconds.
+ */
+async function generateDubbedAudio(
+  segments: Array<{ startTime: number; endTime: number; translatedText: string | null }>,
+  videoDuration: number,
+  voiceId: string,
+  tmpDir: string,
+): Promise<string | null> {
+  const openai = getOpenAI();
+  const ttsDir = path.join(tmpDir, "tts");
+  await fs.mkdir(ttsDir, { recursive: true });
+
+  type Clip = { idx: number; start: number; slot: number; path: string };
+  const clips: Clip[] = [];
+
+  const usable = segments
+    .map((s, i) => ({ ...s, i }))
+    .filter((s) => (s.translatedText ?? "").trim().length > 0);
+
+  // Generate TTS in parallel batches
+  for (let g = 0; g < usable.length; g += TTS_CONCURRENCY) {
+    const groupEnd = Math.min(g + TTS_CONCURRENCY, usable.length);
+    const settled = await Promise.allSettled(
+      usable.slice(g, groupEnd).map(async (s) => {
+        const mp3Path = path.join(ttsDir, `seg_${s.i}.mp3`);
+        const res = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: voiceId,
+          input: s.translatedText!,
+          response_format: "mp3",
+        });
+        const buf = Buffer.from(await res.arrayBuffer());
+        await fs.writeFile(mp3Path, buf);
+        const slot = Math.max(0.5, s.endTime - s.startTime);
+        clips.push({ idx: s.i, start: s.startTime, slot, path: mp3Path });
+      }),
+    );
+    for (const r of settled) {
+      if (r.status === "rejected") {
+        logger.warn({ err: r.reason }, "TTS clip failed");
+      }
+    }
+  }
+
+  if (clips.length === 0) {
+    return null;
+  }
+
+  clips.sort((a, b) => a.start - b.start);
+
+  // Probe each clip's duration so we can fit it to its slot via atempo.
+  async function probeDuration(p: string): Promise<number> {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      p,
+    ]);
+    const d = parseFloat(stdout.trim());
+    return Number.isFinite(d) && d > 0 ? d : 0;
+  }
+
+  function atempoChain(speed: number): string {
+    // atempo supports 0.5..2.0 per stage; chain stages for larger speeds.
+    const stages: number[] = [];
+    let s = speed;
+    while (s > 2.0) { stages.push(2.0); s /= 2.0; }
+    while (s < 0.5) { stages.push(0.5); s /= 0.5; }
+    stages.push(s);
+    return stages.map((v) => `atempo=${v.toFixed(4)}`).join(",");
+  }
+
+  const inputs: string[] = [];
+  const filterParts: string[] = [];
+  // Base silent track (input 0)
+  inputs.push("-f", "lavfi", "-i", `anullsrc=channel_layout=stereo:sample_rate=44100`);
+
+  const overlayLabels: string[] = [];
+  let inputIndex = 1;
+  for (const c of clips) {
+    const dur = await probeDuration(c.path);
+    inputs.push("-i", c.path);
+    const delayMs = Math.max(0, Math.round(c.start * 1000));
+    // If clip is longer than its slot, speed it up so it fits (cap speed at 1.6×
+    // to keep voice natural; if still too long, allow overflow into next slot).
+    const overflow = dur > c.slot * 1.05;
+    const filters: string[] = [];
+    if (overflow) {
+      const speed = Math.min(1.6, dur / Math.max(0.5, c.slot));
+      filters.push(atempoChain(speed));
+    }
+    filters.push(`adelay=${delayMs}|${delayMs}`);
+    filters.push(`apad=pad_dur=0.01`);
+    filterParts.push(`[${inputIndex}:a]${filters.join(",")}[a${inputIndex}]`);
+    overlayLabels.push(`[a${inputIndex}]`);
+    inputIndex++;
+  }
+
+  // Mix base silence + all delayed TTS clips
+  const mixInputs = [`[0:a]`, ...overlayLabels].join("");
+  filterParts.push(
+    `${mixInputs}amix=inputs=${overlayLabels.length + 1}:duration=first:dropout_transition=0:normalize=0[mixed]`,
+  );
+
+  const dubPath = path.join(tmpDir, "dub.m4a");
+  await execFileAsync("ffmpeg", [
+    "-y",
+    ...inputs,
+    "-filter_complex", filterParts.join(";"),
+    "-map", "[mixed]",
+    "-t", videoDuration.toFixed(3),
+    "-c:a", "aac", "-b:a", "160k",
+    dubPath,
+  ]);
+  return dubPath;
+}
+
+/**
+ * Replaces audio in `videoPath` with the dubbed track. Original audio is
+ * ducked to 15% under the dub so background music/SFX remain audible.
+ */
+async function muxDubbedAudio(
+  videoPath: string,
+  dubPath: string,
+  outputPath: string,
+  hasOriginalAudio: boolean,
+): Promise<void> {
+  if (hasOriginalAudio) {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i", videoPath,
+      "-i", dubPath,
+      "-filter_complex",
+      `[0:a]volume=0.15[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`,
+      "-map", "0:v:0",
+      "-map", "[aout]",
+      "-c:v", "copy",
+      "-c:a", "aac", "-b:a", "192k",
+      "-shortest",
+      "-movflags", "+faststart",
+      outputPath,
+    ]);
+  } else {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i", videoPath,
+      "-i", dubPath,
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+      "-c:v", "copy",
+      "-c:a", "aac", "-b:a", "192k",
+      "-shortest",
+      "-movflags", "+faststart",
+      outputPath,
+    ]);
+  }
+}
+
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
 export async function runPipeline(jobId: string): Promise<void> {
@@ -1273,6 +1455,32 @@ export async function runPipeline(jobId: string): Promise<void> {
         await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
       }
 
+      // ── Dubbing (optional) ──────────────────────────────────────────────────
+      const voiceId = normalizeVoiceId(job.voiceId ?? null);
+      if (voiceId) {
+        try {
+          const dubPath = await generateDubbedAudio(
+            segmentRows.map((s) => ({
+              startTime: s.startTime,
+              endTime: s.endTime,
+              translatedText: s.translatedText ?? null,
+            })),
+            videoDuration,
+            voiceId,
+            tmpDir,
+          );
+          if (!dubPath) {
+            logger.info({ jobId }, "no usable TTS clips; keeping original audio");
+          } else {
+            const dubbedVideoPath = path.join(tmpDir, "output.dubbed.mp4");
+            await muxDubbedAudio(outputVideoPath, dubPath, dubbedVideoPath, audioExists);
+            await fs.copyFile(dubbedVideoPath, outputVideoPath);
+          }
+        } catch (dubErr) {
+          logger.warn({ err: dubErr, jobId }, "dubbing failed; keeping original audio");
+        }
+      }
+
       const outputKey = `outputs/${jobId}/${nanoid(8)}.mp4`;
       const srtKey = `outputs/${jobId}/subtitles.srt`;
 
@@ -1293,6 +1501,11 @@ export async function runPipeline(jobId: string): Promise<void> {
 
 // ─── Job creators ─────────────────────────────────────────────────────────────
 
+function normalizeVoiceId(v: string | null | undefined): string | null {
+  if (!v) return null;
+  return VOICE_IDS.has(v) ? v : null;
+}
+
 export async function createFileJob(
   fileKey: string,
   originalFilename: string,
@@ -1301,6 +1514,7 @@ export async function createFileJob(
   sourceLang = "auto",
   targetLang = "he",
   subtitlePosition = "bottom",
+  voiceId: string | null = null,
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -1314,6 +1528,7 @@ export async function createFileJob(
     sourceLang,
     targetLang,
     subtitlePosition,
+    voiceId: normalizeVoiceId(voiceId),
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;
@@ -1326,6 +1541,7 @@ export async function createYouTubeJob(
   sourceLang = "auto",
   targetLang = "he",
   subtitlePosition = "bottom",
+  voiceId: string | null = null,
 ): Promise<string> {
   const id = nanoid();
   await createJob({
@@ -1338,6 +1554,7 @@ export async function createYouTubeJob(
     sourceLang,
     targetLang,
     subtitlePosition,
+    voiceId: normalizeVoiceId(voiceId),
   });
   setImmediate(() => runPipeline(id).catch((err: unknown) => logger.error({ err, jobId: id }, "pipeline error")));
   return id;
