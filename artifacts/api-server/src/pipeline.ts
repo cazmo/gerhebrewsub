@@ -1087,18 +1087,18 @@ async function embedSubtitles(
   const escapedPath = escapeFfmpegSubPath(subPath);
 
   const vfParts: string[] = [];
+  // When delogoRegions exist we need a proper filter-graph (split + overlay)
+  // to do per-region targeted boxblur, so build it separately and skip the
+  // simple comma-chain path.
+  let useGraph = !!(delogoRegions && delogoRegions.length > 0);
+  let graph = "";
 
-  // Inpaint original burned-in text regions with delogo (samples surrounding
-  // pixels). Each region is time-gated to its segment's display window.
-  if (delogoRegions && delogoRegions.length > 0) {
-    // Apply delogo TWICE per region — the first pass replaces the bulk of the
-    // text with samples from surrounding pixels, the second pass smooths out
-    // residue (high-contrast glyph edges) left by the first pass. A larger
-    // `band` value feathers the edges of the replacement so the seam between
-    // patched and untouched pixels is much less visible.
+  if (useGraph && delogoRegions) {
+    // Step 1 — delogo passes (twice per region with feathered band) to inpaint
+    // the original text using surrounding pixels.
+    const delogoParts: string[] = [];
     for (const pass of [0, 1]) {
       for (const r of delogoRegions) {
-        // delogo requires x>0 and y>0 (positive ints); clamp to >=1
         const x = Math.max(1, r.bx);
         const y = Math.max(1, r.by);
         const w = Math.max(2, r.bw);
@@ -1106,15 +1106,61 @@ async function embedSubtitles(
         const s = r.start.toFixed(2);
         const e = r.end.toFixed(2);
         const band = pass === 0 ? 10 : 6;
-        vfParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:band=${band}:enable='between(t,${s},${e})'`);
+        delogoParts.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:band=${band}:enable='between(t,${s},${e})'`);
       }
     }
+
+    // Step 2 — per-region targeted boxblur applied as a chain of
+    // split/crop/boxblur/overlay. This wipes any residual high-frequency
+    // glyph edges that delogo couldn't fully eliminate, without affecting
+    // the rest of the frame or any time outside the segment's window.
+    graph = `[0:v]${delogoParts.join(",")}[base0]`;
+    let prev = "base0";
+    for (let i = 0; i < delogoRegions.length; i++) {
+      const r = delogoRegions[i];
+      const x = Math.max(0, r.bx);
+      const y = Math.max(0, r.by);
+      const w = Math.max(2, Math.min(r.bw, 99999));
+      const h = Math.max(2, r.bh);
+      const s = r.start.toFixed(2);
+      const e = r.end.toFixed(2);
+      const srcLabel = `src${i}`;
+      const mainLabel = `m${i}`;
+      const blurLabel = `bl${i}`;
+      const outLabel = `v${i}`;
+      // Crop the inpainted strip and blur it heavily; overlay only during
+      // the segment's display window so non-subtitle moments are untouched.
+      graph += `;[${prev}]split=2[${mainLabel}][${srcLabel}]`;
+      graph += `;[${srcLabel}]crop=${w}:${h}:${x}:${y},boxblur=lr=12:cr=8[${blurLabel}]`;
+      graph += `;[${mainLabel}][${blurLabel}]overlay=${x}:${y}:enable='between(t,${s},${e})'[${outLabel}]`;
+      prev = outLabel;
+    }
+
+    // Step 3 — subtitle render(s) on the cleaned video.
+    const subFilters: string[] = [];
+    if (isAss) {
+      subFilters.push(`subtitles=${escapedPath}`);
+    } else {
+      // Should not normally happen with delogoRegions, but keep a safe path.
+      subFilters.push(`subtitles=${escapedPath}`);
+    }
+    if (extraBottomSrtPath) {
+      const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
+      const extraStyle = [
+        "FontName=DejaVu Sans","FontSize=26","Alignment=2","MarginV=20",
+        "MarginL=40","MarginR=40","PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000","BackColour=&HCC000000",
+        "BorderStyle=3","Outline=4","Shadow=0","Bold=0","WrapStyle=2",
+      ].join(",");
+      subFilters.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
+    }
+    graph += `;[${prev}]${subFilters.join(",")}[vout]`;
   }
 
-  if (isAss) {
+  if (!useGraph && isAss) {
     // ASS already encodes per-line position, color and size.
     vfParts.push(`subtitles=${escapedPath}`);
-  } else {
+  } else if (!useGraph) {
     const alignment = position === "top" ? 8 : 2;
     const style = coverOriginalSubs
       ? [
@@ -1156,10 +1202,10 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${escapedPath}:force_style='${style}'`);
   }
 
-  // Optional extra bottom subtitle band — used in the burned-in flow so that
-  // viewers get BOTH the in-place replacement AND a classic bottom subtitle
-  // strip like in the non-burned mode.
-  if (extraBottomSrtPath) {
+  // Optional extra bottom subtitle band — used in the non-burned flow so that
+  // viewers get a classic bottom subtitle strip. In the burned-in (useGraph)
+  // path this is already wired into the filter graph above.
+  if (!useGraph && extraBottomSrtPath) {
     const extraEscaped = escapeFfmpegSubPath(extraBottomSrtPath);
     const extraStyle = [
       "FontName=DejaVu Sans",
@@ -1180,14 +1226,26 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
   }
 
-  await execFileAsync("ffmpeg", [
-    "-y", "-i", videoPath,
-    "-vf", vfParts.join(","),
-    "-c:a", "copy",
-    "-preset", "fast",
-    "-movflags", "+faststart",
-    outputPath,
-  ]);
+  const ffmpegArgs = useGraph
+    ? [
+        "-y", "-i", videoPath,
+        "-filter_complex", graph,
+        "-map", "[vout]",
+        "-map", "0:a?",
+        "-c:a", "copy",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        outputPath,
+      ]
+    : [
+        "-y", "-i", videoPath,
+        "-vf", vfParts.join(","),
+        "-c:a", "copy",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        outputPath,
+      ];
+  await execFileAsync("ffmpeg", ffmpegArgs);
 }
 
 // ─── TTS dubbing ─────────────────────────────────────────────────────────────
