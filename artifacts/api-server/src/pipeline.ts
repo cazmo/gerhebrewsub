@@ -711,7 +711,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
 const TRANSLATE_BATCH = 15;
-const TRANSLATE_CONCURRENCY = 4;
+const TRANSLATE_CONCURRENCY = 8;
 
 function parseTranslationLines(raw: string, expected: number): string[] | null {
   let lines = raw.split("\n").filter((l) => l.trim());
@@ -1226,7 +1226,7 @@ async function embedSubtitles(
 
 // ─── TTS dubbing ─────────────────────────────────────────────────────────────
 
-const TTS_CONCURRENCY = 6;
+const TTS_CONCURRENCY = 8;
 
 /**
  * Synthesizes each translated segment to MP3 via OpenAI TTS, then mixes the
