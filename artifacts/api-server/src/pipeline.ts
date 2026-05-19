@@ -88,27 +88,27 @@ const MAX_LINES = 2;
  * Wraps subtitle text into at most 2 lines of ~42 chars each,
  * splitting at word boundaries.
  */
-function formatSubtitleLines(text: string): string {
+function formatSubtitleLines(text: string, maxLines = MAX_LINES, maxChars = MAX_LINE_CHARS): string {
   const words = text.trim().split(/\s+/);
   const lines: string[] = [];
   let current = "";
 
   for (const word of words) {
-    if (lines.length >= MAX_LINES) break;
+    if (lines.length >= maxLines) break;
     const candidate = current ? `${current} ${word}` : word;
-    if (candidate.length <= MAX_LINE_CHARS) {
+    if (candidate.length <= maxChars) {
       current = candidate;
     } else {
       if (current) {
         lines.push(current);
         current = word;
       } else {
-        lines.push(word.slice(0, MAX_LINE_CHARS));
+        lines.push(word.slice(0, maxChars));
         current = "";
       }
     }
   }
-  if (current && lines.length < MAX_LINES) lines.push(current);
+  if (current && lines.length < maxLines) lines.push(current);
 
   return lines.join("\n");
 }
@@ -1045,17 +1045,19 @@ function buildAssFromBurnedSegments(
   for (const seg of layout) {
     const start = secondsToAssTime(seg.start);
     const end = secondsToAssTime(seg.end);
-    const wrapped = formatSubtitleLines(seg.text);
+    // Allow up to 4 lines so longer translations (e.g. RTL Hebrew) wrap
+    // naturally over the cleaned region without being truncated.
+    const wrapped = formatSubtitleLines(seg.text, 4, 42);
     const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
     const bold = seg.bold ? 1 : 0;
-    // BorderStyle 4 = opaque box behind text (uses BackColour); 1 = outline+shadow.
-    const border = seg.hasBox ? 4 : 1;
-    const outlineW = seg.hasBox ? 0 : 2;
-    const shadowW = seg.hasBox ? 0 : 1;
+    // Always use outline+shadow (BorderStyle=1) — never the opaque background
+    // box (BorderStyle=4). The translated subtitle should look like clean
+    // white outlined text over the cleared video, exactly like the original
+    // burned-in style — no black rectangle behind it.
     const textOverride =
       `{\\an5\\pos(${seg.cx},${seg.cy})\\fs${seg.fontSize}` +
-      `\\c${seg.primary}\\3c${seg.outline}\\4c${seg.back}` +
-      `\\bord${outlineW}\\shad${shadowW}\\b${bold}\\bs${border}}`;
+      `\\c${seg.primary}\\3c${seg.outline}\\4c&H80000000&` +
+      `\\bord2\\shad1\\b${bold}\\bs1}`;
     events.push(
       `Dialogue: 1,${start},${end},Default,,0,0,0,,${textOverride}${safe}`,
     );
