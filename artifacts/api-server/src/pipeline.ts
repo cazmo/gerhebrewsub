@@ -914,15 +914,20 @@ function computeBurnedSegmentLayout(
     const st: OcrFrameStyle = seg.style ?? {
       yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
     };
-    const padY = Math.round(videoH * 0.012);
-    const padX = Math.round(videoW * 0.015);
-    const bw = Math.max(40, Math.round(st.width * videoW) + padX * 2);
-    const bh = Math.max(20, Math.round(st.height * videoH) + padY * 2);
-    const cx = Math.round(st.xCenter * videoW);
+    // Model bbox is often tight on the glyphs; widen significantly so delogo
+    // reliably removes the original text even with imprecise OCR coordinates.
+    // Strategy: full-width horizontal band centered at the detected yCenter,
+    // with height = max(OCR height + padding, 14% of video height).
+    const bandHeight = Math.max(Math.round(st.height * videoH * 2.2), Math.round(videoH * 0.14));
+    const bw = videoW - 4; // full width minus 2px margin
+    const bh = bandHeight;
+    const cx = Math.round(videoW / 2); // re-center horizontally to mid-screen
     const cy = Math.round(st.yCenter * videoH);
-    const bx = Math.max(0, Math.min(videoW - bw, cx - Math.round(bw / 2)));
-    const by = Math.max(0, Math.min(videoH - bh, cy - Math.round(bh / 2)));
-    const fontSize = Math.max(16, Math.min(64, Math.round(st.height * videoH * 0.55)));
+    const bx = 2;
+    const by = Math.max(2, Math.min(videoH - bh - 2, cy - Math.round(bh / 2)));
+    // Font size: scale relative to video height so subtitles are clearly
+    // readable (≈ 5–6% of video height per line).
+    const fontSize = Math.max(28, Math.min(72, Math.round(videoH * 0.055)));
     out.push({ start: seg.start, end: seg.end, text, bx, by, bw, bh, cx, cy, fontSize, primary: hexToAssColor(st.color) });
   }
   return out;
