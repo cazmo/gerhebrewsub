@@ -734,11 +734,14 @@ async function translateBatch(
   batchLabel: string,
 ): Promise<string[]> {
   const numbered = batch.map((s, idx) => `${idx + 1}. ${s.text}`).join("\n");
-  const srcName = langName(sourceLang);
   const tgtName = langName(targetLang);
+  const fromClause =
+    sourceLang && sourceLang !== "auto"
+      ? `from ${langName(sourceLang)} to ${tgtName}`
+      : `to ${tgtName} (auto-detect the source language of each line)`;
   const systemPrompt =
     `You are a professional subtitle translator. ` +
-    `Translate the following ${batch.length} numbered subtitle lines from ${srcName} to ${tgtName}. ` +
+    `Translate the following ${batch.length} numbered subtitle lines ${fromClause}. ` +
     `Return EXACTLY one translated line per input line, in the same order, with the same numbering (1. 2. 3. ...). ` +
     `Each translation must be on its own separate line. Do NOT merge lines or add commentary. ` +
     `Keep each translation to at most 80 characters so it fits on 2 subtitle lines — rephrase concisely if needed.`;
