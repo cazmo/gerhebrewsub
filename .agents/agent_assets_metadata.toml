@@ -1,0 +1,14 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "NApie5MbgwNVfFqKAMP7g"
+uri = "file://attached_assets/translated_frame117.jpg"
+type = "image"
+title = "פריים מתורגם — שנייה 117"
+
+[[outputs]]
+id = "F0mA4GCmtcOH1IOMIg83f"
+uri = "file://attached_assets/translated_frame85.jpg"
+type = "image"
+title = "פריים מתורגם — שנייה 85"
