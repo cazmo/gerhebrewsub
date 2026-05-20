@@ -169,10 +169,11 @@ interface WhisperSegment {
 }
 
 interface OcrFrameStyle {
-  yCenter: number; // 0..1
+  yCenter: number; // 0..1 (center of WHOLE block)
   xCenter: number; // 0..1
-  height: number;  // 0..1
+  height: number;  // 0..1 — height of ONE LINE (not the whole block)
   width: number;   // 0..1
+  lineCount?: number; // how many visible lines in the source block
   color: string;   // #RRGGBB — text fill
   bgColor?: string;     // #RRGGBB — background box color, if any
   hasBox?: boolean;     // true if text sits on an opaque/translucent box
@@ -579,11 +580,16 @@ function parseOcrJson(raw: string): { text: string; style?: OcrFrameStyle } {
     const outlineColor = hex(obj.outlineColor, undefined);
     const hasBox = obj.hasBox === true || obj.hasBox === "true";
     const bold = obj.bold === true || obj.bold === "true";
+    const lcRaw = typeof obj.lineCount === "number"
+      ? obj.lineCount
+      : parseInt(String(obj.lineCount ?? ""), 10);
+    const lineCount = Number.isFinite(lcRaw) && lcRaw >= 1 ? Math.min(8, Math.round(lcRaw)) : 1;
     const style: OcrFrameStyle = {
       yCenter: num(obj.yCenter, 0.9),
       xCenter: num(obj.xCenter, 0.5),
       height: num(obj.height, 0.06),
       width: num(obj.width, 0.6),
+      lineCount,
       color,
       bgColor,
       hasBox,
@@ -639,16 +645,21 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                     {
                       type: "text",
                       text:
-                        `Read any burned-in subtitle/overlay text in this frame, translate to ${targetLangName}, ` +
+                        `Read ALL burned-in subtitle/overlay text in this frame (including multi-line ` +
+                        `blocks — read every line, do NOT truncate), translate the full text to ${targetLangName}, ` +
                         `and measure its bounding box in pixels. Return STRICT JSON ONLY, no prose:\n` +
-                        `{"text":"<translation, ≤80 chars>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB","outlineColor":"#RRGGBB","hasBox":<bool>,"bgColor":"#RRGGBB","bold":<bool>}\n` +
-                        `Coords normalized 0..1 (x=0 left, y=0 top). Measure from pixels — subs may be top/mid/bottom.\n` +
+                        `{"text":"<full translation, keep newlines as \\n>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"lineCount":<int ≥1>,"color":"#RRGGBB","outlineColor":"#RRGGBB","hasBox":<bool>,"bgColor":"#RRGGBB","bold":<bool>}\n` +
+                        `Coords normalized 0..1 (x=0 left, y=0 top). yCenter/xCenter = center of the WHOLE text block.\n` +
+                        `height = height of ONE LINE only (cap to baseline of a single line, ` +
+                        `even when the block has many lines). width = horizontal extent of the longest line.\n` +
+                        `lineCount = how many visible lines the block actually has.\n` +
+                        `Subs may be top/mid/bottom — measure from pixels, don't assume.\n` +
                         `If no readable subtitle (ignore corner logos), return {"text":"NONE"}.`,
                     },
                   ],
                 },
               ],
-              max_tokens: 120,
+              max_tokens: 300,
             });
             const raw = (res.choices[0]?.message?.content ?? "").trim();
             const parsed = parseOcrJson(raw);
@@ -706,11 +717,13 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
         styles.reduce((acc, s) => acc + s[k], 0) / styles.length;
       const boxVotes = styles.filter((s) => s.hasBox).length;
       const boldVotes = styles.filter((s) => s.bold).length;
+      const maxLc = styles.reduce((m, s) => Math.max(m, s.lineCount ?? 1), 1);
       avgStyle = {
         yCenter: avg("yCenter"),
         xCenter: avg("xCenter"),
         height: avg("height"),
         width: avg("width"),
+        lineCount: maxLc,
         color: styles[0].color,
         outlineColor: styles.find((s) => s.outlineColor)?.outlineColor,
         bgColor: styles.find((s) => s.bgColor)?.bgColor,
@@ -990,13 +1003,14 @@ interface BurnedSegmentLayout {
   bx: number; by: number; bw: number; bh: number; // pixel delogo bbox
   cx: number; cy: number;                          // center
   fontSize: number;
+  lineCount: number;                               // # lines in source block
   primary: string;                                 // ASS PrimaryColour (text fill)
   outline: string;                                 // ASS OutlineColour
   back: string;                                    // ASS BackColour (used when hasBox)
   hasBox: boolean;
   bold: boolean;
   textW: number;                                   // pixel width of original text bbox
-  textH: number;                                   // pixel height of original text bbox
+  textH: number;                                   // pixel height of original text bbox (per-line)
 }
 
 function computeBurnedSegmentLayout(
@@ -1011,30 +1025,29 @@ function computeBurnedSegmentLayout(
     const st: OcrFrameStyle = seg.style ?? {
       yCenter: 0.9, xCenter: 0.5, height: 0.06, width: 0.6, color: "#FFFFFF",
     };
-    // Font size matched to the OCR-detected glyph height. 1.05× compensates
-    // for the OCR usually under-reporting (it measures cap height, not full
-    // line height with descenders). Wider clamp so big on-screen titles
-    // aren't shrunk.
+    const lineCount = Math.max(1, Math.min(8, st.lineCount ?? 1));
+    // Font size = OCR-detected per-line glyph height × small upscale to
+    // compensate for OCR usually under-reporting cap-vs-line-height.
     const detectedFs = Math.round(st.height * videoH * 1.05);
     const fontSize = Math.max(16, Math.min(140, detectedFs || Math.round(videoH * 0.055)));
     const cx = Math.max(0, Math.min(videoW, Math.round(st.xCenter * videoW)));
     const cy = Math.max(0, Math.min(videoH, Math.round(st.yCenter * videoH)));
-    const textH = Math.max(8, Math.round(st.height * videoH));
+    const lineH = Math.max(8, Math.round(st.height * videoH));
+    const textH = lineH; // single-line height
+    const blockH = lineH * lineCount;
     const textW = Math.max(20, Math.round(st.width * videoW));
-    // Mask box — tight rectangle that fully covers the original text plus a
-    // generous margin for outline/shadow. Drawn as a solid black box (see
-    // embedSubtitles), guaranteeing zero residue. Width gets +30% margin
-    // (outline + side glow), height gets +60% (descenders, top accents,
-    // drop shadow).
+    // Mask box — must cover the WHOLE multi-line block. Width gets +30%
+    // margin (outline + side glow), height = block height × 1.4 to absorb
+    // line spacing + descenders + outline.
     const maskW = Math.min(videoW - 4, Math.max(40, Math.round(textW * 1.3)));
-    const maskH = Math.min(videoH - 4, Math.max(20, Math.round(textH * 1.6)));
+    const maskH = Math.min(videoH - 4, Math.max(20, Math.round(blockH * 1.4)));
     const bw = maskW;
     const bh = maskH;
     const bx = Math.max(2, Math.min(videoW - bw - 2, cx - Math.round(bw / 2)));
     const by = Math.max(2, Math.min(videoH - bh - 2, cy - Math.round(bh / 2)));
     out.push({
       start: seg.start, end: seg.end, text,
-      bx, by, bw, bh, cx, cy, fontSize,
+      bx, by, bw, bh, cx, cy, fontSize, lineCount,
       primary: hexToAssColor(st.color),
       outline: hexToAssColor(st.outlineColor ?? "#000000"),
       back: hexToAssColor(st.bgColor ?? "#000000"),
@@ -1056,7 +1069,14 @@ function buildAssFromBurnedSegments(
   layout: BurnedSegmentLayout[],
   videoW: number,
   videoH: number,
+  spokenStrip?: Array<{ start: number; end: number; text: string }>,
 ): string {
+  // Bottom-strip style: classic spoken-audio subtitle band, white text on
+  // semi-transparent black box, anchored bottom-center. Lives in the SAME
+  // ASS file as the in-place burned-in events so a single libass pass
+  // renders both — chaining two ffmpeg `subtitles=` filters causes the
+  // second one to silently drop on many libass builds.
+  const bottomFs = Math.max(20, Math.round(videoH * 0.05));
   const header =
     "[Script Info]\n" +
     "ScriptType: v4.00+\n" +
@@ -1068,6 +1088,7 @@ function buildAssFromBurnedSegments(
     "[V4+ Styles]\n" +
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n" +
     "Style: Default,DejaVu Sans,28,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,1,5,0,0,0,1\n" +
+    `Style: Bottom,DejaVu Sans,${bottomFs},&H00FFFFFF,&H000000FF,&H00000000,&HCC000000,0,0,0,0,100,100,0,0,3,4,0,2,40,40,30,1\n` +
     "Style: Cover,DejaVu Sans,10,&H00000000,&H00000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n" +
     "\n" +
     "[Events]\n" +
@@ -1077,15 +1098,19 @@ function buildAssFromBurnedSegments(
   for (const seg of layout) {
     const start = secondsToAssTime(seg.start);
     const end = secondsToAssTime(seg.end);
-    // Allow up to 4 lines so longer translations (e.g. RTL Hebrew) wrap
-    // naturally over the cleaned region without being truncated.
-    const wrapped = formatSubtitleLines(seg.text, 4, 42);
+    // Wrap to match the source block: up to `lineCount` lines, with chars
+    // per line scaled to the detected width. This preserves the visual
+    // footprint of the original German block so the Hebrew rendering
+    // occupies the same vertical span at the same font size — instead of
+    // shrinking everything to 2 short lines.
+    const maxLines = Math.max(2, Math.min(8, seg.lineCount));
+    // Estimate chars-per-line from the OCR-measured text width vs font size.
+    // At ~0.55em per char for DejaVu Sans, perLine = textW / (fs * 0.55).
+    const perLine = Math.max(20, Math.min(80, Math.round(seg.textW / (seg.fontSize * 0.55))));
+    const wrapped = formatSubtitleLines(seg.text, maxLines, perLine);
     const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
     const bold = seg.bold ? 1 : 0;
-    // Always use outline+shadow (BorderStyle=1) — never the opaque background
-    // box (BorderStyle=4). The translated subtitle should look like clean
-    // white outlined text over the cleared video, exactly like the original
-    // burned-in style — no black rectangle behind it.
+    // Outline+shadow (BorderStyle=1) — clean text matching the original.
     const textOverride =
       `{\\an5\\pos(${seg.cx},${seg.cy})\\fs${seg.fontSize}` +
       `\\c${seg.primary}\\3c${seg.outline}\\4c&H80000000&` +
@@ -1093,6 +1118,19 @@ function buildAssFromBurnedSegments(
     events.push(
       `Dialogue: 1,${start},${end},Default,,0,0,0,,${textOverride}${safe}`,
     );
+  }
+
+  // Spoken-audio bottom strip (independent layer so it draws even when an
+  // in-place event covers the same time range).
+  if (spokenStrip && spokenStrip.length > 0) {
+    for (const seg of spokenStrip) {
+      if (!seg.text?.trim()) continue;
+      const start = secondsToAssTime(seg.start);
+      const end = secondsToAssTime(seg.end);
+      const wrapped = formatSubtitleLines(seg.text, 2, 42);
+      const safe = escapeAssText(wrapped).replace(/\n/g, "\\N");
+      events.push(`Dialogue: 2,${start},${end},Bottom,,0,0,0,,${safe}`);
+    }
   }
 
   // Silence unused-param lint (kept for header sizing)
@@ -1675,13 +1713,25 @@ export async function runPipeline(jobId: string): Promise<void> {
           vidW,
           vidH,
         );
-        const assContent = buildAssFromBurnedSegments(layout, vidW, vidH);
+        // Build single ASS file containing BOTH in-place OCR translations
+        // AND the spoken-audio bottom strip. Two libass passes (chained
+        // `subtitles=` filters) don't reliably composite — the second one
+        // gets dropped silently. Merging into one ASS guarantees both
+        // layers render.
+        const spokenStripForAss = spokenSubs
+          .filter((s) => s.translatedText?.trim())
+          .map((s) => ({
+            start: s.startTime,
+            end: s.endTime,
+            text: s.translatedText as string,
+          }));
+        const assContent = buildAssFromBurnedSegments(layout, vidW, vidH, spokenStripForAss);
         const assPath = path.join(tmpDir, "subtitles.ass");
         await fs.writeFile(assPath, assContent, "utf8");
-        // Burn ASS (in-place replacement) AND bottom strip from spoken SRT
-        // (falls back to OCR SRT if no spoken segments).
-        const bottomSrt = spokenSubs.length > 0 ? spokenSrtPath : srtPath;
-        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout, bottomSrt);
+        await embedSubtitles(videoPath, assPath, outputVideoPath, true, subtitlePosition, layout);
+        // spokenSrtPath was prepared above for backward-compat / debugging
+        // but is no longer required as a separate ffmpeg input.
+        void spokenSrtPath;
       } else {
         await embedSubtitles(videoPath, srtPath, outputVideoPath, hasBurnedInSubs, subtitlePosition);
       }
