@@ -53,7 +53,8 @@ A German-to-Hebrew subtitle translator. Upload a video file or provide a YouTube
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- **Always push to GitHub after every change.** Run `sh push-to-github.sh` at the end of every task (the api-server dev workflow also auto-pushes on startup, but explicit pushes are required after every checkpoint).
+- Hebrew responses by default. "אתה לא מחליט" = make the call yourself; "בצע מה שביקשתי" = execute the proposal as-is.
 
 ## Gotchas
 
