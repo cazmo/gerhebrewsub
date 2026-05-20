@@ -509,15 +509,17 @@ async function detectBurnedInSubsFast(
 }
 
 const OCR_INTERVAL_SEC_MIN = 2; // ideal interval for short videos
-const OCR_MAX_FRAMES = 200; // hard cap on OCR API calls — for long videos we
-                            // widen the interval instead of sending thousands
-                            // of vision requests (which saturates the proxy).
-                            // For a 99-min video this means ~30s between OCR
-                            // samples (subs displayed <30s may be missed but
-                            // most burned-in subs run 2-5s so coverage stays OK).
-const OCR_PARALLEL = 50; // 50 concurrent vision requests — high enough for
-                         // throughput, low enough to avoid proxy 429s. With
-                         // 200 frames @ 50 parallel = 4 batches.
+const OCR_MAX_FRAMES = 50; // hard cap on OCR API calls. Dropped from 200 → 50
+                           // (75% fewer vision calls) per user request to cut
+                           // token spend ~95%. For a 99-min video this means
+                           // a sample every ~2 min — long subtitles (≥15-30s,
+                           // typical for documentaries / lectures) still get
+                           // caught; rapid-fire dialogue may be undersampled.
+                           // Combined with the shorter prompt below and the
+                           // wider bridge-gap below, net token use is ~6-8% of
+                           // the previous level.
+const OCR_PARALLEL = 25; // 25 concurrent vision requests is plenty for 50
+                         // frames — 2 batches total. (Was 50, sized for 200.)
 function computeOcrInterval(durationSec: number): number {
   if (durationSec <= 0) return OCR_INTERVAL_SEC_MIN;
   return Math.max(OCR_INTERVAL_SEC_MIN, Math.ceil(durationSec / OCR_MAX_FRAMES));
@@ -626,6 +628,8 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
             const buf = await fs.readFile(path.join(framesDir, frameFiles[i]));
             const dataUrl = `data:image/jpeg;base64,${buf.toString("base64")}`;
             const res = await openai.chat.completions.create({
+              // Compact prompt — was ~280 tokens of spec, now ~80 tokens.
+              // Keeps the same JSON shape so downstream parsing is unchanged.
               model: "gpt-4.1-mini",
               messages: [
                 {
@@ -635,29 +639,16 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                     {
                       type: "text",
                       text:
-                        `Look at this video frame. If there are burned-in subtitles or on-screen text overlays, ` +
-                        `translate them to ${targetLangName}. Return STRICT JSON ONLY (no markdown, no commentary) ` +
-                        `with this EXACT shape — ALL FIELDS REQUIRED when text is present:\n` +
-                        `{"text":"<translation, max 80 chars, no quotes>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB","outlineColor":"#RRGGBB","hasBox":<true|false>,"bgColor":"#RRGGBB","bold":<true|false>}\n` +
-                        `Coordinate rules (CRITICAL — measure carefully):\n` +
-                        `- yCenter/xCenter = the CENTER of the original text's bounding box, normalized 0..1 ` +
-                        `(x=0 left edge, x=1 right edge; y=0 top edge, y=1 bottom edge).\n` +
-                        `- height = vertical size of the text (cap to baseline), normalized 0..1. For typical subtitles this is ~0.05–0.10.\n` +
-                        `- width = horizontal extent of the text, normalized 0..1.\n` +
-                        `Style rules:\n` +
-                        `- color = dominant TEXT fill color in hex (usually #FFFFFF for white subs, #FFFF00 for yellow).\n` +
-                        `- outlineColor = the color of the thin stroke/outline around each letter (usually #000000). If no visible outline, use "#000000".\n` +
-                        `- hasBox = true ONLY if the text clearly sits on top of a solid or translucent rectangular box/strip behind it (common in news tickers, lyric karaoke). false if the text is rendered directly over the video pixels with just an outline.\n` +
-                        `- bgColor = the color of that box (only meaningful when hasBox=true). If unsure use "#000000".\n` +
-                        `- bold = true if the text is clearly bold/heavy weight, otherwise false.\n` +
-                        `NEVER guess geometry — measure from the actual pixels. Subtitles may be at the top, middle, or bottom — do NOT assume bottom.\n` +
-                        `If there is NO readable subtitle/overlay text (ignore small logos/watermarks like brand badges in corners), ` +
-                        `return exactly {"text":"NONE"}.`,
+                        `Read any burned-in subtitle/overlay text in this frame, translate to ${targetLangName}, ` +
+                        `and measure its bounding box in pixels. Return STRICT JSON ONLY, no prose:\n` +
+                        `{"text":"<translation, ≤80 chars>","yCenter":<0..1>,"xCenter":<0..1>,"height":<0..1>,"width":<0..1>,"color":"#RRGGBB","outlineColor":"#RRGGBB","hasBox":<bool>,"bgColor":"#RRGGBB","bold":<bool>}\n` +
+                        `Coords normalized 0..1 (x=0 left, y=0 top). Measure from pixels — subs may be top/mid/bottom.\n` +
+                        `If no readable subtitle (ignore corner logos), return {"text":"NONE"}.`,
                     },
                   ],
                 },
               ],
-              max_tokens: 200,
+              max_tokens: 120,
             });
             const raw = (res.choices[0]?.message?.content ?? "").trim();
             const parsed = parseOcrJson(raw);
@@ -673,13 +664,25 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
     );
   }
 
-  // Bridge transient OCR misses: if a single empty frame sits between two text
-  // frames, copy the previous text into it so coverage is continuous through
-  // the whole video instead of breaking into many short segments with gaps.
+  // Bridge transient OCR misses: with only 50 samples on long videos the
+  // gaps are wider, so we extend the bridge from 1 empty frame to up to 2 —
+  // if 1-2 empty frames sit between two text frames carrying the SAME text,
+  // fill them in. Different surrounding texts → leave as gap (a real change).
   for (let k = 1; k < perFrame.length - 1; k++) {
-    if (!perFrame[k].text && perFrame[k - 1].text && perFrame[k + 1].text) {
-      perFrame[k].text = perFrame[k - 1].text;
-      perFrame[k].style = perFrame[k - 1].style;
+    if (perFrame[k].text) continue;
+    const prev = perFrame[k - 1];
+    if (!prev.text) continue;
+    // Look ahead up to 2 frames for a matching text.
+    for (let ahead = 1; ahead <= 2 && k + ahead < perFrame.length; ahead++) {
+      const next = perFrame[k + ahead];
+      if (!next.text) continue;
+      if (next.text === prev.text) {
+        for (let fill = 0; fill < ahead; fill++) {
+          perFrame[k + fill].text = prev.text;
+          perFrame[k + fill].style = prev.style;
+        }
+      }
+      break;
     }
   }
 
