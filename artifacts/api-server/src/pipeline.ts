@@ -196,7 +196,7 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 6; // split audio into 6-sec pieces for tight speech-to-subtitle sync
+const SUBTITLE_CHUNK_SECONDS = 60; // 60-sec chunks; whisper-1 returns native per-segment timestamps inside each chunk
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
@@ -238,31 +238,34 @@ interface VerboseTranscription {
 }
 
 /**
- * Transcribe a single audio chunk (≤25MB) using gpt-4o-mini-transcribe with
- * json response_format. Returns the raw text for this chunk.
+ * Transcribe a single audio chunk (≤25MB) using whisper-1 with verbose_json.
+ * Returns per-segment timestamps RELATIVE to the chunk's start (0..chunkDur).
  */
-async function transcribeChunkText(
+async function transcribeChunkSegments(
   openai: OpenAI,
   audioPath: string,
   sourceLang: string,
-): Promise<string> {
+): Promise<Array<{ start: number; end: number; text: string }>> {
   const { createReadStream, statSync } = await import("fs");
   const size = statSync(audioPath).size;
-  if (size === 0) return "";
+  if (size === 0) return [];
 
   const langParam = sourceLang !== "auto" ? sourceLang : undefined;
   const fileStream = createReadStream(audioPath);
 
-  const result = await openai.audio.transcriptions.create(
+  const result = (await openai.audio.transcriptions.create(
     {
       file: fileStream as never,
-      model: "gpt-4o-mini-transcribe",
+      model: "whisper-1",
       ...(langParam ? { language: langParam } : {}),
-      response_format: "json",
+      response_format: "verbose_json",
     },
     { timeout: TRANSCRIBE_TIMEOUT_MS }
-  );
-  return result.text?.trim() ?? "";
+  )) as unknown as { segments?: Array<{ start: number; end: number; text: string }> };
+
+  return (result.segments ?? [])
+    .map((s) => ({ start: s.start, end: s.end, text: (s.text ?? "").trim() }))
+    .filter((s) => s.text.length > 0);
 }
 
 /**
@@ -278,8 +281,10 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
   const numChunks = Math.ceil(totalDuration / SUBTITLE_CHUNK_SECONDS);
   const allSegments: WhisperSegment[] = [];
 
-  // Process chunks in parallel groups of 8 to stay within rate limits
-  const PARALLEL = 8;
+  // Process chunks in parallel groups of 20 — whisper-1 returns native
+  // per-segment timestamps inside each 60-sec chunk, so the chunk count
+  // (and number of API calls) is ~10× smaller than the old 6-sec scheme.
+  const PARALLEL = 20;
   for (let g = 0; g < numChunks; g += PARALLEL) {
     const groupEnd = Math.min(g + PARALLEL, numChunks);
     const chunkPaths: string[] = [];
@@ -302,37 +307,27 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
       })
     );
 
-    // Transcribe all chunks in this group in parallel
-    const texts = await Promise.all(
+    // Transcribe all chunks in this group in parallel, collecting native
+    // per-segment timestamps from whisper-1 verbose_json.
+    const results = await Promise.all(
       chunkPaths.map((cp, idx) => {
         const i = g + idx;
-        const startSec = i * SUBTITLE_CHUNK_SECONDS;
-        const endSec = Math.min(startSec + SUBTITLE_CHUNK_SECONDS, totalDuration);
-        return transcribeChunkText(openai, cp, sourceLang)
-          .then((text) => ({ text, startSec, endSec }))
-          .catch(() => ({ text: "", startSec, endSec }));
+        const chunkStart = i * SUBTITLE_CHUNK_SECONDS;
+        return transcribeChunkSegments(openai, cp, sourceLang)
+          .then((segs) => ({ segs, chunkStart }))
+          .catch(() => ({ segs: [] as Array<{ start: number; end: number; text: string }>, chunkStart }));
       })
     );
 
-    // Cleanup chunk files
     await Promise.all(chunkPaths.map((cp) => fs.unlink(cp).catch(() => {})));
 
-    // Build segments — split long chunk text into multiple sub-subtitles
-    for (const { text, startSec, endSec } of texts) {
-      if (!text) continue;
-      const pieces = splitTextIntoSubtitlePieces(text, MAX_SUBTITLE_LINE_CHARS * 2).filter((p) => p.length > 0);
-      if (pieces.length === 0) continue;
-      const span = Math.max(endSec - startSec, 0.5);
-      const sliceDur = span / pieces.length;
-      for (let p = 0; p < pieces.length; p++) {
-        const subStart = startSec + p * sliceDur;
-        const subEnd = Math.min(startSec + (p + 1) * sliceDur, endSec);
-        if (subEnd - subStart < 0.2) continue; // skip impossibly short slices
+    for (const { segs, chunkStart } of results) {
+      for (const s of segs) {
         allSegments.push({
           id: allSegments.length,
-          start: subStart,
-          end: subEnd,
-          text: pieces[p],
+          start: chunkStart + s.start,
+          end: chunkStart + s.end,
+          text: s.text,
         });
       }
     }
