@@ -196,7 +196,7 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 60; // 60-sec chunks — small so PARALLEL=1000 actually parallelizes; for a 99-min video this means ~99 concurrent Whisper calls vs 1 serial call
+const SUBTITLE_CHUNK_SECONDS = 180; // 3-min chunks — balance between parallelism (33 calls for 99-min video) and proxy concurrency limits (going above ~50 concurrent often gets throttled)
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -278,6 +278,10 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
 
   if (totalDuration <= 0) return [];
 
+  // NOTE: a "single-call" fast path on the full compressed audio was tried
+  // and was SLOWER (≈ +130 s vs chunked) — the Replit AI proxy serializes a
+  // big-file whisper-1 request, while 33 parallel chunks finish in ≈150 s
+  // because the proxy fans them out. Keep the chunked path.
   const numChunks = Math.ceil(totalDuration / SUBTITLE_CHUNK_SECONDS);
   const allSegments: WhisperSegment[] = [];
 
@@ -499,8 +503,20 @@ async function detectBurnedInSubsFast(
   }
 }
 
-const OCR_INTERVAL_SEC = 2; // sample frame every 2s for tight sync with burned-in subs
-const OCR_PARALLEL = 1000;
+const OCR_INTERVAL_SEC_MIN = 2; // ideal interval for short videos
+const OCR_MAX_FRAMES = 200; // hard cap on OCR API calls — for long videos we
+                            // widen the interval instead of sending thousands
+                            // of vision requests (which saturates the proxy).
+                            // For a 99-min video this means ~30s between OCR
+                            // samples (subs displayed <30s may be missed but
+                            // most burned-in subs run 2-5s so coverage stays OK).
+const OCR_PARALLEL = 50; // 50 concurrent vision requests — high enough for
+                         // throughput, low enough to avoid proxy 429s. With
+                         // 200 frames @ 50 parallel = 4 batches.
+function computeOcrInterval(durationSec: number): number {
+  if (durationSec <= 0) return OCR_INTERVAL_SEC_MIN;
+  return Math.max(OCR_INTERVAL_SEC_MIN, Math.ceil(durationSec / OCR_MAX_FRAMES));
+}
 
 function findFirstJsonObject(s: string): string | null {
   // Walks the string and returns the first balanced {...} block.
@@ -576,10 +592,12 @@ function parseOcrJson(raw: string): { text: string; style?: OcrFrameStyle } {
 async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: string): Promise<OcrResult> {
   const framesDir = path.join(tmpDir, "frames");
   await fs.mkdir(framesDir, { recursive: true });
+  const vidDur = await getAudioDuration(videoPath);
+  const ocrInterval = computeOcrInterval(vidDur);
   await execFileAsync("ffmpeg", [
     "-i", videoPath,
-    "-vf", `fps=1/${OCR_INTERVAL_SEC}`,
-    "-q:v", "2",
+    "-vf", `fps=1/${ocrInterval},scale=512:-2`,
+    "-q:v", "5",
     path.join(framesDir, "frame_%04d.jpg"),
   ]);
 
@@ -608,7 +626,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
                 {
                   role: "user",
                   content: [
-                    { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+                    { type: "image_url", image_url: { url: dataUrl, detail: "low" } },
                     {
                       type: "text",
                       text:
@@ -670,8 +688,8 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
     if (!text) { i++; continue; }
     let j = i + 1;
     while (j < perFrame.length && perFrame[j].text === text) j++;
-    const start = i * OCR_INTERVAL_SEC;
-    const end = j * OCR_INTERVAL_SEC;
+    const start = i * ocrInterval;
+    const end = j * ocrInterval;
     const styles = perFrame.slice(i, j).map((p) => p.style).filter((s): s is OcrFrameStyle => !!s);
     let avgStyle: OcrFrameStyle | undefined;
     if (styles.length > 0) {
@@ -853,7 +871,15 @@ async function hasAudioStream(videoPath: string): Promise<boolean> {
 }
 
 async function extractAudio(inputPath: string, outputMp3: string): Promise<void> {
-  await execFileAsync("ffmpeg", ["-y", "-i", inputPath, "-vn", "-acodec", "libmp3lame", "-q:a", "4", outputMp3]);
+  // Compress directly to mono 16kHz @ 24kbps mp3 — same format Whisper needs.
+  // This makes the master audio.mp3 ~30× smaller (e.g. 91MB → ~3MB for 99 min),
+  // which dramatically speeds up the per-chunk ffmpeg subdivision step.
+  await execFileAsync("ffmpeg", [
+    "-y", "-i", inputPath, "-vn",
+    "-ac", "1", "-ar", "16000",
+    "-acodec", "libmp3lame", "-b:a", "24k",
+    outputMp3,
+  ]);
 }
 
 async function getYouTubeDurationSec(url: string, cookiesPath?: string): Promise<number> {
@@ -1178,18 +1204,32 @@ async function embedSubtitles(
 
   const totalDur = await getAudioDuration(videoPath);
   const NUM_SEG = 6; // matches available CPUs; each ffmpeg runs single-threaded
-  const X264_PARAMS = "ref=1:bframes=0:weightp=0:8x8dct=0:cabac=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1";
+  // veryfast (not ultrafast) + CRF 26 + downscale to 360p: produces ~5× smaller
+  // output (~100MB vs ~580MB for a 99-min source) which dramatically cuts the
+  // GCS upload time at the end of the embedding stage. Encode speed stays
+  // roughly the same because the smaller pixel count offsets the slower
+  // preset. We append the scale filter AFTER existing vfParts so subtitles
+  // and delogo run on the original-resolution frames (where their pixel
+  // coordinates are calibrated) and the scale happens last.
+  // Cap output width at 640 to control file size / upload time. Use
+  // `trunc(.../2)*2` to guarantee an even width (libx264 + yuv420p requires
+  // both dimensions even); `-2` handles the height side.
+  const VF_TAIL = ",scale='trunc(min(iw,640)/2)*2':-2";
+  const VCODEC_FLAGS = [
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+    "-pix_fmt", "yuv420p",
+    "-tune", "fastdecode",
+    "-g", "60", "-keyint_min", "60",
+    "-movflags", "+faststart",
+  ];
 
   // Short videos: single pass (parallelization overhead not worth it)
   if (totalDur <= 0 || totalDur < 90) {
     await execFileAsync("ffmpeg", [
       "-y", "-threads", "0", "-i", videoPath,
-      "-vf", vfParts.join(","),
-      "-c:a", "copy",
-      "-c:v", "libx264", "-preset", "ultrafast",
-      "-tune", "fastdecode,zerolatency",
-      "-x264-params", X264_PARAMS,
-      "-movflags", "+faststart",
+      "-vf", vfParts.join(",") + VF_TAIL,
+      "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+      ...VCODEC_FLAGS,
       outputPath,
     ]);
     return;
@@ -1204,7 +1244,7 @@ async function embedSubtitles(
   await Promise.all(
     Array.from({ length: NUM_SEG }, async (_, i) => {
       const start = i * segDur;
-      const thisDur = i === NUM_SEG - 1 ? totalDur - start : segDur;
+      const end = i === NUM_SEG - 1 ? totalDur : start + segDur;
       const segOut = `${outputPath}.seg${i}.mp4`;
       segFiles[i] = segOut;
       await execFileAsync("ffmpeg", [
@@ -1212,16 +1252,18 @@ async function embedSubtitles(
         "-ss", start.toFixed(3),
         "-copyts",
         "-i", videoPath,
-        "-t", thisDur.toFixed(3),
-        "-vf", vfParts.join(","),
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-tune", "fastdecode,zerolatency",
-        "-x264-params", X264_PARAMS,
+        // With `-copyts` the input PTS is preserved, so `-t D` (which means
+        // "stop after D seconds of OUTPUT PTS counted from 0") would terminate
+        // immediately for any segment where start > D. Use `-to` (absolute
+        // input-PTS stop time) instead. Bug fix: previous `-t` produced empty
+        // outputs for segments 2..N.
+        "-to", end.toFixed(3),
+        "-vf", vfParts.join(",") + VF_TAIL,
+        ...VCODEC_FLAGS,
         "-threads", "1",
         "-c:a", "aac", "-b:a", "96k", "-ac", "2",
         "-output_ts_offset", `-${start.toFixed(3)}`,
         "-avoid_negative_ts", "make_zero",
-        "-movflags", "+faststart",
         segOut,
       ]);
     }),
@@ -1492,30 +1534,22 @@ export async function runPipeline(jobId: string): Promise<void> {
         if (whisperSegments.length > 0) {
           hasBurnedInSubs = await detectBurnedInSubsFast(videoPath, tmpDir);
         } else {
-          // No audio → assume burned-in if any text frames exist
           hasBurnedInSubs = true;
         }
       } catch {
         hasBurnedInSubs = false;
       }
 
-      // Preserve the original spoken-audio segments — they are used to build
-      // the bottom subtitle strip (translation of the SPEAKER), independently
-      // of the burned-in on-screen text that goes in the in-place overlay.
       const spokenSegments: WhisperSegment[] = whisperSegments.slice();
 
-      // When burned-in subs detected → OCR-translate them and use those
-      // segments as the in-place subtitle source. The OCR timing tracks the
-      // actual on-screen subtitle display, so correlation is correct.
       if (hasBurnedInSubs) {
         const ocrResult = await extractTextViaOcr(videoPath, tmpDir, targetLang);
         if (ocrResult.segments.length > 0) {
           whisperSegments = ocrResult.segments;
-          burnedInTranslatedAlready = true; // OCR already returned target-lang text
+          burnedInTranslatedAlready = true;
           hasBurnedInSubs = ocrResult.hasBurnedInSubs;
           await updateJob(jobId, { hasBurnedInSubs: true });
         } else if (whisperSegments.length === 0) {
-          // No audio AND no OCR text → bail out below
           hasBurnedInSubs = false;
         }
       }
