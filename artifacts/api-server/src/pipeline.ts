@@ -284,7 +284,7 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
   // Process chunks in parallel groups of 20 — whisper-1 returns native
   // per-segment timestamps inside each 60-sec chunk, so the chunk count
   // (and number of API calls) is ~10× smaller than the old 6-sec scheme.
-  const PARALLEL = 50;
+  const PARALLEL = 200;
   for (let g = 0; g < numChunks; g += PARALLEL) {
     const groupEnd = Math.min(g + PARALLEL, numChunks);
     const chunkPaths: string[] = [];
@@ -499,7 +499,7 @@ async function detectBurnedInSubsFast(
 }
 
 const OCR_INTERVAL_SEC = 2; // sample frame every 2s for tight sync with burned-in subs
-const OCR_PARALLEL = 50;
+const OCR_PARALLEL = 200;
 
 function findFirstJsonObject(s: string): string | null {
   // Walks the string and returns the first balanced {...} block.
@@ -706,7 +706,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
 const TRANSLATE_BATCH = 15;
-const TRANSLATE_CONCURRENCY = 50;
+const TRANSLATE_CONCURRENCY = 200;
 
 function parseTranslationLines(raw: string, expected: number): string[] | null {
   let lines = raw.split("\n").filter((l) => l.trim());
@@ -1185,7 +1185,7 @@ async function embedSubtitles(
 
 // ─── TTS dubbing ─────────────────────────────────────────────────────────────
 
-const TTS_CONCURRENCY = 50;
+const TTS_CONCURRENCY = 200;
 
 /**
  * Synthesizes each translated segment to MP3 via OpenAI TTS, then mixes the
