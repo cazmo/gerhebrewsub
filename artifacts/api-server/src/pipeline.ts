@@ -196,7 +196,7 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 6000; // 100-min chunks (mono 16kHz @ 24kbps mp3 ≈ 18MB, under Whisper's 25MB cap); whisper-1 returns native per-segment timestamps inside each chunk
+const SUBTITLE_CHUNK_SECONDS = 60; // 60-sec chunks — small so PARALLEL=1000 actually parallelizes; for a 99-min video this means ~99 concurrent Whisper calls vs 1 serial call
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -1176,18 +1176,66 @@ async function embedSubtitles(
     vfParts.push(`subtitles=${extraEscaped}:force_style='${extraStyle}'`);
   }
 
+  const totalDur = await getAudioDuration(videoPath);
+  const NUM_SEG = 6; // matches available CPUs; each ffmpeg runs single-threaded
+  const X264_PARAMS = "ref=1:bframes=0:weightp=0:8x8dct=0:cabac=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1";
+
+  // Short videos: single pass (parallelization overhead not worth it)
+  if (totalDur <= 0 || totalDur < 90) {
+    await execFileAsync("ffmpeg", [
+      "-y", "-threads", "0", "-i", videoPath,
+      "-vf", vfParts.join(","),
+      "-c:a", "copy",
+      "-c:v", "libx264", "-preset", "ultrafast",
+      "-tune", "fastdecode,zerolatency",
+      "-x264-params", X264_PARAMS,
+      "-movflags", "+faststart",
+      outputPath,
+    ]);
+    return;
+  }
+
+  // Parallel-segment encoding: split into N time slices, run N ffmpeg processes
+  // in parallel using `-copyts` so the subtitle/delogo filter expressions keep
+  // their original absolute timestamps. `-output_ts_offset` shifts output PTS
+  // back to 0 for each segment so concat-demux works.
+  const segDur = totalDur / NUM_SEG;
+  const segFiles: string[] = new Array(NUM_SEG);
+  await Promise.all(
+    Array.from({ length: NUM_SEG }, async (_, i) => {
+      const start = i * segDur;
+      const thisDur = i === NUM_SEG - 1 ? totalDur - start : segDur;
+      const segOut = `${outputPath}.seg${i}.mp4`;
+      segFiles[i] = segOut;
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-ss", start.toFixed(3),
+        "-copyts",
+        "-i", videoPath,
+        "-t", thisDur.toFixed(3),
+        "-vf", vfParts.join(","),
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-tune", "fastdecode,zerolatency",
+        "-x264-params", X264_PARAMS,
+        "-threads", "1",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-output_ts_offset", `-${start.toFixed(3)}`,
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+        segOut,
+      ]);
+    }),
+  );
+
+  const listPath = `${outputPath}.concat.txt`;
+  await fs.writeFile(
+    listPath,
+    segFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
+    "utf8",
+  );
   await execFileAsync("ffmpeg", [
-    "-y",
-    "-threads", "0",
-    "-i", videoPath,
-    "-vf", vfParts.join(","),
-    "-c:a", "copy",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-tune", "fastdecode,zerolatency",
-    "-x264-params", "ref=1:bframes=0:weightp=0:8x8dct=0:cabac=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
-    "-threads", "0",
-    "-movflags", "+faststart",
+    "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+    "-c", "copy", "-movflags", "+faststart",
     outputPath,
   ]);
 }
