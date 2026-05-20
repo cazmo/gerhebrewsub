@@ -178,7 +178,10 @@ app.post("/api/upload", upload.single("video"), async (req, res) => {
 
 const chunkUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  // Must be ≥ Home.tsx CHUNK_SIZE (50MB). When the limit is smaller,
+  // multer rejects mid-stream and the client sees a 2-min hang/abort
+  // instead of a clear error.
+  limits: { fileSize: 64 * 1024 * 1024 },
 });
 
 app.post("/api/upload/init", (req, res) => {
