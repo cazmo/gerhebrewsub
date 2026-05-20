@@ -705,7 +705,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
 // ─── Translation ─────────────────────────────────────────────────────────────
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
-const TRANSLATE_BATCH = 150;
+const TRANSLATE_BATCH = 500;
 const TRANSLATE_CONCURRENCY = 1000;
 
 function parseTranslationLines(raw: string, expected: number): string[] | null {
@@ -879,6 +879,8 @@ async function downloadYouTube(url: string, outputPath: string, cookiesPath?: st
     "--merge-output-format", "mp4",
     "--socket-timeout", "30",
     "--retries", "3",
+    "--concurrent-fragments", "16",
+    "-N", "16",
     "-o", outputPath,
   ];
 
@@ -1174,10 +1176,16 @@ async function embedSubtitles(
   }
 
   await execFileAsync("ffmpeg", [
-    "-y", "-i", videoPath,
+    "-y",
+    "-threads", "0",
+    "-i", videoPath,
     "-vf", vfParts.join(","),
     "-c:a", "copy",
+    "-c:v", "libx264",
     "-preset", "ultrafast",
+    "-tune", "fastdecode,zerolatency",
+    "-x264-params", "ref=1:bframes=0:weightp=0:8x8dct=0:cabac=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1",
+    "-threads", "0",
     "-movflags", "+faststart",
     outputPath,
   ]);
