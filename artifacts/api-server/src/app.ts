@@ -4,7 +4,7 @@ import pinoHttp from "pino-http";
 import multer from "multer";
 import os from "os";
 import pathMod from "path";
-import { promises as fs } from "fs";
+import { promises as fs, createReadStream } from "fs";
 import { nanoid } from "nanoid";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import router from "./routes/index.js";
@@ -13,7 +13,7 @@ import { appRouter } from "./trpcRouter.js";
 import { getJobById } from "./db.js";
 import { gcsBucket, gcsUpload, gcsEnsurePublic, gcsPublicUrl, saveGlobalCookies } from "./gcsHelper.js";
 import { getCapture, setJobId, createSetupCapture, markSetupComplete } from "./captureStore.js";
-import { createYouTubeJob } from "./pipeline.js";
+import { createYouTubeJob, LOCAL_OUTPUTS_DIR } from "./pipeline.js";
 
 interface ChunkSession {
   path: string;
@@ -263,25 +263,77 @@ app.use((err: unknown, _req: express.Request, res: express.Response, next: expre
   next(err);
 });
 
+// Resolve the output MP4 source for a job. Prefers the local-disk copy
+// written by the pipeline (fast path — no GCS upload) and falls back to the
+// GCS object if the file is missing (e.g. server restarted, disk cleaned).
+async function resolveOutputSource(jobId: string): Promise<
+  | { kind: "local"; path: string; size: number }
+  | { kind: "gcs"; key: string; size: number }
+  | null
+> {
+  const job = await getJobById(jobId);
+  if (!job || job.status !== "completed" || !job.outputKey) return null;
+  const localPath = pathMod.join(LOCAL_OUTPUTS_DIR, `${jobId}.mp4`);
+  try {
+    const st = await fs.stat(localPath);
+    if (st.isFile() && st.size > 0) {
+      return { kind: "local", path: localPath, size: st.size };
+    }
+  } catch {
+    /* try GCS below if outputKey is a real GCS object */
+  }
+  // outputKey starting with `local:` means the MP4 was never uploaded to
+  // GCS — don't waste a round-trip on a 404; just return null so the
+  // route returns a clean 404 to the client.
+  if (job.outputKey.startsWith("local:")) return null;
+  try {
+    const file = gcsBucket().file(job.outputKey);
+    const [metadata] = await file.getMetadata();
+    const size = Number(metadata.size ?? 0);
+    return { kind: "gcs", key: job.outputKey, size };
+  } catch {
+    return null;
+  }
+}
+
+function pipeWithCleanup(
+  src: NodeJS.ReadableStream,
+  res: import("express").Response,
+  req: import("express").Request,
+  label: string,
+): void {
+  const cleanup = () => {
+    const maybe = src as unknown as { destroy?: () => void };
+    if (typeof maybe.destroy === "function") maybe.destroy();
+  };
+  req.on("close", cleanup);
+  src
+    .on("error", (err) => {
+      logger.error({ err }, `${label} error`);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    })
+    .pipe(res);
+}
+
 app.get("/api/download/:jobId", async (req, res) => {
   try {
-    const job = await getJobById(req.params.jobId);
-    if (!job || job.status !== "completed" || !job.outputKey) {
+    const src = await resolveOutputSource(req.params.jobId);
+    if (!src) {
       res.status(404).json({ error: "סרטון לא נמצא" });
       return;
     }
     const filename = `video-subtitled-${req.params.jobId.slice(0, 8)}.mp4`;
-    const file = gcsBucket().file(job.outputKey);
-    const [metadata] = await file.getMetadata();
-    const fileSize = Number(metadata.size ?? 0);
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "no-store");
-    if (fileSize > 0) res.setHeader("Content-Length", fileSize);
-    file.createReadStream()
-      .on("error", (err) => { logger.error({ err }, "GCS download error"); if (!res.headersSent) res.status(500).end(); })
-      .pipe(res);
+    if (src.size > 0) res.setHeader("Content-Length", src.size);
+    const stream =
+      src.kind === "local"
+        ? createReadStream(src.path)
+        : gcsBucket().file(src.key).createReadStream();
+    pipeWithCleanup(stream, res, req, "download");
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "שגיאה";
     if (!res.headersSent) res.status(500).json({ error: msg });
@@ -290,18 +342,16 @@ app.get("/api/download/:jobId", async (req, res) => {
 
 app.get("/api/stream/:jobId", async (req, res) => {
   try {
-    const job = await getJobById(req.params.jobId);
-    if (!job || job.status !== "completed" || !job.outputKey) {
+    const src = await resolveOutputSource(req.params.jobId);
+    if (!src) {
       res.status(404).json({ error: "סרטון לא נמצא" });
       return;
     }
-    const file = gcsBucket().file(job.outputKey);
-    const [metadata] = await file.getMetadata();
-    const fileSize = Number(metadata.size ?? 0);
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "no-store");
     const rangeHeader = req.headers.range;
+    const fileSize = src.size;
     if (rangeHeader && fileSize > 0) {
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0] ?? "0", 10);
@@ -310,14 +360,18 @@ app.get("/api/stream/:jobId", async (req, res) => {
       res.status(206);
       res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
       res.setHeader("Content-Length", chunkSize);
-      file.createReadStream({ start, end })
-        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
-        .pipe(res);
+      const stream =
+        src.kind === "local"
+          ? createReadStream(src.path, { start, end })
+          : gcsBucket().file(src.key).createReadStream({ start, end });
+      pipeWithCleanup(stream, res, req, "stream-range");
     } else {
       if (fileSize > 0) res.setHeader("Content-Length", fileSize);
-      file.createReadStream()
-        .on("error", (e) => { if (!res.headersSent) res.status(500).end(); else res.end(); logger.error({ err: e }, "GCS stream error"); })
-        .pipe(res);
+      const stream =
+        src.kind === "local"
+          ? createReadStream(src.path)
+          : gcsBucket().file(src.key).createReadStream();
+      pipeWithCleanup(stream, res, req, "stream");
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "שגיאה";

@@ -197,6 +197,11 @@ const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
 const SUBTITLE_CHUNK_SECONDS = 180; // 3-min chunks — balance between parallelism (33 calls for 99-min video) and proxy concurrency limits (going above ~50 concurrent often gets throttled)
+// Persistent local-disk dir where finished output MP4s are kept, served via
+// `/api/download/:jobId` and `/api/stream/:jobId`. Skipping the 100-500 MB
+// GCS upload saves ~10-30 s per job. Uses /tmp by default but lives outside
+// the per-job tmpDir so it survives the pipeline cleanup.
+export const LOCAL_OUTPUTS_DIR = process.env.LOCAL_OUTPUTS_DIR ?? "/tmp/gerhebrewsub-outputs";
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -1131,16 +1136,54 @@ async function embedSubtitles(
   // display window. The translated subtitle is drawn afterwards at the
   // same cx/cy with the same font size, color, outline as detected by OCR.
   if (delogoRegions && delogoRegions.length > 0) {
-    for (const r of delogoRegions) {
-      // delogo requires x>=1, y>=1, and box fully inside frame.
-      const x = Math.max(1, r.bx);
-      const y = Math.max(1, r.by);
-      const w = Math.max(2, r.bw);
-      const h = Math.max(2, r.bh);
-      const s = r.start.toFixed(2);
-      const e = r.end.toFixed(2);
+    // SPEED: merge adjacent regions whose bboxes overlap (typical case:
+    // consecutive OCR samples of the same on-screen subtitle position).
+    // Each delogo filter has per-frame overhead even when gated by `enable=`,
+    // so cutting the chain from 200+ to ~30-60 has a measurable encode-time
+    // win on long videos. Two regions merge when they are close in time
+    // (≤4 s gap) AND their bboxes have IoU > 0.5 — we expand the bbox to
+    // their union and stretch the enable= window to cover both.
+    type Merged = { x: number; y: number; w: number; h: number; start: number; end: number };
+    const merged: Merged[] = [];
+    const sorted = delogoRegions
+      .slice()
+      .sort((a, b) => a.start - b.start);
+    for (const r of sorted) {
+      const cur: Merged = {
+        x: Math.max(1, r.bx),
+        y: Math.max(1, r.by),
+        w: Math.max(2, r.bw),
+        h: Math.max(2, r.bh),
+        start: r.start,
+        end: r.end,
+      };
+      const last = merged[merged.length - 1];
+      if (last && cur.start - last.end <= 4) {
+        const ix1 = Math.max(last.x, cur.x);
+        const iy1 = Math.max(last.y, cur.y);
+        const ix2 = Math.min(last.x + last.w, cur.x + cur.w);
+        const iy2 = Math.min(last.y + last.h, cur.y + cur.h);
+        const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+        const union = last.w * last.h + cur.w * cur.h - inter;
+        const iou = union > 0 ? inter / union : 0;
+        if (iou > 0.5) {
+          const nx = Math.min(last.x, cur.x);
+          const ny = Math.min(last.y, cur.y);
+          const nx2 = Math.max(last.x + last.w, cur.x + cur.w);
+          const ny2 = Math.max(last.y + last.h, cur.y + cur.h);
+          last.x = nx;
+          last.y = ny;
+          last.w = nx2 - nx;
+          last.h = ny2 - ny;
+          last.end = Math.max(last.end, cur.end);
+          continue;
+        }
+      }
+      merged.push(cur);
+    }
+    for (const r of merged) {
       vfParts.push(
-        `delogo=x=${x}:y=${y}:w=${w}:h=${h}:enable='between(t,${s},${e})'`,
+        `delogo=x=${r.x}:y=${r.y}:w=${r.w}:h=${r.h}:enable='between(t,${r.start.toFixed(2)},${r.end.toFixed(2)})'`,
       );
     }
   }
@@ -1674,15 +1717,26 @@ export async function runPipeline(jobId: string): Promise<void> {
         }
       }
 
-      const outputKey = `outputs/${jobId}/${nanoid(8)}.mp4`;
+      // SPEED: instead of uploading the 100-500 MB output mp4 to GCS (slow
+      // network leg at the end of every job), copy it into a persistent
+      // local-disk dir and serve it from there via the `/api/download/:jobId`
+      // route. Saves ~10-30 s per job for long videos. SRT is tiny → still
+      // goes to GCS so the public link works regardless of server lifetime.
+      // Sentinel `local:` outputKey signals to the download/stream routes
+      // (resolveOutputSource) that the MP4 was never uploaded to GCS and
+      // lives only on local disk. This is honest about durability: if the
+      // container restarts / /tmp is cleaned, the download will 404 instead
+      // of issuing a GCS metadata request for an object that was never
+      // created. The user accepted this trade-off to skip the slow upload.
+      const outputKey = `local:${jobId}.mp4`;
       const srtKey = `outputs/${jobId}/subtitles.srt`;
+      const localOutputPath = path.join(LOCAL_OUTPUTS_DIR, `${jobId}.mp4`);
 
-      const [outputBuffer] = await Promise.all([
-        fs.readFile(outputVideoPath),
+      await fs.mkdir(LOCAL_OUTPUTS_DIR, { recursive: true });
+      await Promise.all([
+        fs.copyFile(outputVideoPath, localOutputPath),
         gcsUpload(srtKey, Buffer.from(srtContent, "utf8"), "text/plain"),
       ]);
-      await gcsUpload(outputKey, outputBuffer, "video/mp4");
-      await gcsEnsurePublic(outputKey);
 
       await updateJob(jobId, { status: "completed", outputKey, srtKey });
     } catch (err: unknown) {
