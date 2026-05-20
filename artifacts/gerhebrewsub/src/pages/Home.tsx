@@ -8,7 +8,7 @@ type Tab = "file" | "youtube";
 
 const MAX_SIZE_MB = 500;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
-const CHUNK_SIZE = 5 * 1024 * 1024;
+const CHUNK_SIZE = 50 * 1024 * 1024;
 
 // Languages available for source (includes auto-detect)
 const SOURCE_LANGS: [string, string][] = [

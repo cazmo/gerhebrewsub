@@ -196,7 +196,7 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 60; // 60-sec chunks; whisper-1 returns native per-segment timestamps inside each chunk
+const SUBTITLE_CHUNK_SECONDS = 600; // 10-min chunks; whisper-1 returns native per-segment timestamps inside each chunk (~10× fewer API calls)
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
@@ -705,7 +705,7 @@ async function extractTextViaOcr(videoPath: string, tmpDir: string, targetLang: 
 // ─── Translation ─────────────────────────────────────────────────────────────
 
 const TRANSLATE_TIMEOUT_MS = 2 * 60 * 1000;
-const TRANSLATE_BATCH = 15;
+const TRANSLATE_BATCH = 150;
 const TRANSLATE_CONCURRENCY = 1000;
 
 function parseTranslationLines(raw: string, expected: number): string[] | null {
@@ -1177,7 +1177,7 @@ async function embedSubtitles(
     "-y", "-i", videoPath,
     "-vf", vfParts.join(","),
     "-c:a", "copy",
-    "-preset", "fast",
+    "-preset", "ultrafast",
     "-movflags", "+faststart",
     outputPath,
   ]);
