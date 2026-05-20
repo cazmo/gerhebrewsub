@@ -198,7 +198,7 @@ const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
 const SUBTITLE_CHUNK_SECONDS = 6000; // 100-min chunks (mono 16kHz @ 24kbps mp3 ≈ 18MB, under Whisper's 25MB cap); whisper-1 returns native per-segment timestamps inside each chunk
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
-const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
+const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;
 
 // ─── SRT parser (for transcription response_format:"srt") ────────────────────
 
