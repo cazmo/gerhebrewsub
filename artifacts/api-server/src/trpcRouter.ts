@@ -71,7 +71,12 @@ export const appRouter = t.router({
     startFromYouTube: t.procedure
       .input(
         z.object({
-          url: z.string().url(),
+          url: z.string().min(1).transform((s) => {
+            const trimmed = s.trim();
+            // Auto-prepend https:// if user pasted bare host (e.g. youtu.be/abc)
+            if (!/^https?:\/\//i.test(trimmed)) return `https://${trimmed}`;
+            return trimmed;
+          }),
           cookiesKey: z.string().optional(),
           sourceLang: langCodeSchema,
           targetLang: langCodeSchema,
