@@ -196,7 +196,7 @@ const MAX_VIDEO_DURATION_SEC = 120 * 60;
 const MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const CHUNK_SECONDS = 600; // large-file splitting (kept for reference)
-const SUBTITLE_CHUNK_SECONDS = 600; // 10-min chunks; whisper-1 returns native per-segment timestamps inside each chunk (~10× fewer API calls)
+const SUBTITLE_CHUNK_SECONDS = 6000; // 100-min chunks (mono 16kHz @ 24kbps mp3 ≈ 18MB, under Whisper's 25MB cap); whisper-1 returns native per-segment timestamps inside each chunk
 const MAX_SUBTITLE_LINE_CHARS = 42; // per project spec: 2-line subs ≤42 chars each
 const TRANSCRIBE_TIMEOUT_MS = 3 * 60 * 1000;
 
@@ -301,7 +301,8 @@ async function transcribeWithWhisper(audioPath: string, sourceLang: string): Pro
           "-y", "-i", audioPath,
           "-ss", String(startSec),
           "-t", String(chunkDuration),
-          "-acodec", "libmp3lame", "-q:a", "4",
+          "-ac", "1", "-ar", "16000",
+          "-acodec", "libmp3lame", "-b:a", "24k",
           chunkPath,
         ]).catch(() => null);
       })
